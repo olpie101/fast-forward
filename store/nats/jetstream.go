@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,28 +29,22 @@ type EncodingRegisterer interface {
 }
 
 type Store struct {
-	js  nats.JetStreamContext
-	enc EncodingRegisterer
-	// stream string
+	js     nats.JetStreamContext
+	enc    EncodingRegisterer
 	logger *zap.SugaredLogger
 }
 
 func New(js nats.JetStreamContext, enc EncodingRegisterer, logger *zap.SugaredLogger) *Store {
 	return &Store{
-		js:  js,
-		enc: enc,
-		// stream: stream,
+		js:     js,
+		enc:    enc,
 		logger: logger,
 	}
 }
 
-// func (s *Store) defaultBus() event.Bus {
-
-// }
-
 // Insert inserts events into the store.
 func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
-	s.logger.Infow("inserting events")
+	s.logger.Debugw("inserting events")
 	for _, evt := range evts {
 		u, name, version := evt.Aggregate()
 		b, err := s.enc.Marshal(evt.Data())
@@ -70,7 +63,6 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 		}
 
 		msg := &nats.Msg{
-			// Subject: strings.ReplaceAll(evt.Name(), ".", "_"),
 			Subject: sub,
 			Header:  headers,
 			Data:    b,
@@ -78,10 +70,8 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 
 		opts := []nats.PubOpt{
 			nats.MsgId(evt.ID().String()),
+			nats.ExpectLastSequencePerSubject(0),
 		}
-		// if pick.AggregateVersion(evt) > 1 {
-		opts = append(opts, nats.ExpectLastSequencePerSubject(0))
-		// }
 
 		_, err = s.js.PublishMsg(
 			msg,
@@ -93,7 +83,7 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 			return err
 		}
 	}
-	s.logger.Infow("inserted events")
+	s.logger.Debug("inserted events")
 	return nil
 }
 
@@ -105,111 +95,23 @@ func (s *Store) Find(_ context.Context, _ uuid.UUID) (event.Event, error) {
 // Query queries the store for events and returns two channels – one for the
 // returned events and one for any asynchronous errors that occur during the
 // query.
-//
-//	var store event.Store
-//	events, errs, err := store.Query(context.TODO(), query.New(...))
-//	// handle err
-//	err := streams.Walk(context.TODO(), func(evt event.Event) {
-//		log.Println(fmt.Sprintf("Queried event: %s", evt.Name()))
-//	}, events, errs)
-//	// handle err
 func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <-chan error, error) {
-	fmt.Printf("query %+v\n", q.AggregateIDs())
-	fmt.Printf("query %+v\n", q.AggregateNames())
-	fmt.Printf("query %d\n", len(q.Aggregates()))
+	s.logger.Debug("query",
+		"ids", q.AggregateIDs(),
+		"names", q.AggregateNames(),
+		"aggregates", len(q.Aggregates()),
+		"event_name", q.Names(),
+	)
 
-	fmt.Printf("query %+v\n", q.Names())
-	// ctx, cancel := context.WithTimeout(ctx, time.Second)
-	// defer cancel()
 	evtChan := make(chan event.Of[any])
 	errChan := make(chan error)
-	sig := make(chan error)
 
-	// err := s.bus.Subscribe(ctx, complaint.ComplaintEvents[0:]...)
 	subjects, err := s.buildQuery(q)
 	if err != nil {
 		return nil, nil, err
 	}
-	err = s.query(ctx, q, subjects, evtChan, errChan, sig)
-	if err != nil {
-		return nil, nil, err
-	}
 
-	// sub, err := s.js.Subscribe(
-	// 	fmt.Sprintf("es.%s.%s.*.*", q.AggregateNames()[0], q.AggregateIDs()[0]),
-	// 	func(msg *nats.Msg) {
-	// 		evtId, _, evtTime, err := parseEventValues(msg)
-	// 		if err != nil {
-	// 			errChan <- err
-	// 			return
-	// 		}
-
-	// 		aggName, aggId, aggVersion, eventName, err := subjectToValues(msg.Subject)
-	// 		// aggId, aggName, aggVersion, err := parseAggregateValues(msg)
-	// 		if err != nil {
-	// 			errChan <- err
-	// 			return
-	// 		}
-
-	// 		data, err := s.enc.Unmarshal(msg.Data, eventName)
-	// 		if err != nil {
-	// 			errChan <- err
-	// 			return
-	// 		}
-
-	// 		e := event.New(
-	// 			eventName,
-	// 			data,
-	// 			event.ID(evtId),
-	// 			event.Time(evtTime),
-	// 			event.Aggregate(aggId, aggName, aggVersion),
-	// 		)
-	// 		evtChan <- e
-
-	// 		i, _, err := msg.Sub.Pending()
-	// 		if err != nil {
-	// 			errChan <- err
-	// 		}
-	// 		if i == 1 {
-	// 			sig <- ErrEndOfMsgs
-	// 		}
-	// 	},
-	// 	nats.OrderedConsumer(),
-	// 	nats.ReplayInstant(),
-	// 	nats.BindStream(s.stream),
-	// 	nats.Context(ctx),
-	// )
-
-	// if err != nil {
-	// 	return nil, nil, err
-	// }
-
-	go func() {
-	L:
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Println("DONE>>>>")
-				errChan <- context.DeadlineExceeded
-			case err = <-sig:
-				fmt.Println("SIG>>>>")
-				if !errors.Is(err, nats.ErrBadSubscription) && !errors.Is(err, ErrEndOfMsgs) {
-					fmt.Println("ERR>>>>")
-					errChan <- err
-				}
-				// close(evtChan)
-				break L
-			}
-		}
-		// err = sub.Unsubscribe()
-		// if err != nil {
-		// 	errChan <- err
-		// }
-		// close(evtChan)
-		close(errChan)
-		close(sig)
-	}()
-
+	go s.query(ctx, q, subjects, evtChan, errChan)
 	return evtChan, errChan, nil
 }
 
@@ -235,12 +137,19 @@ func (s *Store) buildQuery(q event.Query) ([]string, error) {
 	return subjects, nil
 }
 
-func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evtChan chan<- event.Event, errChan chan<- error, sig chan<- error) error {
+type evtTest func(m eventMetadata) bool
+
+var defaultEvtTest = func(m eventMetadata) bool { return true }
+
+func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evts chan<- event.Event, errs chan<- error) {
+	defer close(evts)
+	defer close(errs)
 	opts := []nats.SubOpt{
 		nats.OrderedConsumer(),
 		nats.ReplayInstant(),
 		nats.Context(ctx),
 	}
+
 	if q.AggregateVersions() != nil && len(q.AggregateVersions().Min()) > 0 {
 		min := min(q.AggregateVersions().Min())
 		opts = append(opts, nats.StartSequence(uint64(min)))
@@ -250,35 +159,55 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 		opts = append(opts, nats.StartTime(q.Times().Min()))
 	}
 
-	hasMaxVersion := false
-	hasMaxTime := false
-	var maxVersion uint64
-	var maxTime time.Time
+	maxVerTest := defaultEvtTest
+	maxTimeTest := defaultEvtTest
 
 	if q.AggregateVersions() != nil && len(q.AggregateVersions().Max()) > 0 {
-		maxVersion = uint64(max(q.AggregateVersions().Max()))
+		maxVerTest = func(m eventMetadata) bool {
+			return m.aggregateVersion <= max(q.AggregateVersions().Max())
+		}
 	}
 
 	if q.Times() != nil && (q.Times().Max() != time.Time{}) {
-		maxTime = q.Times().Max()
-	}
-
-	var wg sync.WaitGroup
-	for _, subject := range subjects {
-		wg.Add(1)
-		// TODO: keep track of all subscriptions
-		_, err := s.js.Subscribe(
-			subject,
-			s.processQueryMsg(&wg, errChan, evtChan, sig, hasMaxVersion, maxVersion, hasMaxTime, maxTime),
-			opts...,
-		)
-
-		if err != nil {
-			return err
+		maxTimeTest = func(m eventMetadata) bool {
+			return m.evtTime.Before(q.Times().Max().Add(time.Microsecond))
 		}
 	}
-	wg.Wait()
-	return nil
+
+	msgs := make(chan *nats.Msg, len(subjects))
+	for _, subject := range subjects {
+		_, err := s.js.ChanSubscribe(subject, msgs, opts...)
+		if err != nil {
+			s.logger.Errorw("err sub", "err", err)
+			errs <- err
+			return
+		}
+	}
+
+	exp := 10 * time.Millisecond
+	t := time.NewTimer(exp)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-msgs:
+			test := func(md eventMetadata) bool {
+				return maxVerTest(md) && maxTimeTest(md)
+			}
+			evt, ok, err := s.processQueryMsg(m, test)
+			if err != nil {
+				errs <- err
+			}
+			if !ok {
+				continue
+			}
+
+			evts <- evt
+			t.Reset(exp)
+		case <-t.C:
+			return
+		}
+	}
 }
 
 func buildAggregatesQuery(names []string) []string {
@@ -365,10 +294,10 @@ func (s *Store) Delete(_ context.Context, _ ...event.Event) error {
 	panic("not implemented") // TODO: Implement
 }
 
-func parseEventValues(msg *nats.Msg) (uuid.UUID, string, time.Time, error) {
-	evtName := msg.Header.Get("event-name")
-	evtTime := msg.Header.Get("event-time")
-	evtId := msg.Header.Get("Nats-Msg-Id")
+func parseEventValues(h nats.Header) (uuid.UUID, string, time.Time, error) {
+	evtName := h.Get("event-name")
+	evtTime := h.Get("event-time")
+	evtId := h.Get("Nats-Msg-Id")
 
 	id, err := uuid.Parse(evtId)
 	if err != nil {
@@ -383,11 +312,10 @@ func parseEventValues(msg *nats.Msg) (uuid.UUID, string, time.Time, error) {
 	return id, evtName, t, nil
 }
 
-func parseAggregateValues(msg *nats.Msg) (uuid.UUID, string, int, error) {
-	aggName := msg.Header.Get("aggregate-name")
-	aggId := msg.Header.Get("aggregate-id")
-	aggVersion := msg.Header.Get("aggregate-version")
-	fmt.Println(">>> testing")
+func parseAggregateValues(h nats.Header) (uuid.UUID, string, int, error) {
+	aggName := h.Get("aggregate-name")
+	aggId := h.Get("aggregate-id")
+	aggVersion := h.Get("aggregate-version")
 
 	id, err := uuid.Parse(aggId)
 	if err != nil {
@@ -437,55 +365,60 @@ func eventSubFromEvent(evtName string) (string, error) {
 	return parts[3], nil
 }
 
-func (s *Store) processQueryMsg(wg *sync.WaitGroup, errChan chan<- error, evtChan chan<- event.Event, sig chan<- error, hasMaxVersion bool, maxVersion uint64, hasMaxTime bool, maxTime time.Time) func(*nats.Msg) {
-	return func(msg *nats.Msg) {
-		fmt.Println("message received")
-		evtId, evtName, evtTime, err := parseEventValues(msg)
-		if err != nil {
-			errChan <- err
-			return
-		}
+type eventMetadata struct {
+	evtId            uuid.UUID
+	evtName          string
+	evtTime          time.Time
+	aggregateName    string
+	aggregateId      uuid.UUID
+	aggregateVersion int
+}
 
-		aggName, aggId, aggVersion, err := subjectToValues(msg.Subject)
-		// aggId, aggName, aggVersion, err := parseAggregateValues(msg)
-		if err != nil {
-			errChan <- err
-			return
-		}
-
-		if hasMaxVersion && aggVersion > int(maxVersion) {
-			return
-		}
-
-		if hasMaxTime && evtTime.After(maxTime) {
-			return
-		}
-
-		data, err := s.enc.Unmarshal(msg.Data, evtName)
-		if err != nil {
-			errChan <- err
-			return
-		}
-
-		e := event.New(
-			evtName,
-			data,
-			event.ID(evtId),
-			event.Time(evtTime),
-			event.Aggregate(aggId, aggName, aggVersion),
-		)
-		evtChan <- e
-
-		i, _, err := msg.Sub.Pending()
-		if err != nil {
-			errChan <- err
-			return
-		}
-		if i == 1 {
-			wg.Done()
-			// sig <- ErrEndOfMsgs
-		}
+func getMetadata(h nats.Header, sub string) (eventMetadata, error) {
+	evtId, evtName, evtTime, err := parseEventValues(h)
+	if err != nil {
+		return eventMetadata{}, err
 	}
+
+	aggName, aggId, aggVersion, err := subjectToValues(sub)
+	if err != nil {
+		return eventMetadata{}, err
+	}
+
+	return eventMetadata{
+		evtId:            evtId,
+		evtName:          evtName,
+		evtTime:          evtTime,
+		aggregateName:    aggName,
+		aggregateId:      aggId,
+		aggregateVersion: aggVersion,
+	}, nil
+}
+
+func (s *Store) processQueryMsg(msg *nats.Msg, t evtTest) (event.Event, bool, error) {
+	metadata, err := getMetadata(msg.Header, msg.Subject)
+	if err != nil {
+		return nil, false, err
+	}
+
+	ok := t(metadata)
+	if !ok {
+		return nil, false, nil
+	}
+
+	data, err := s.enc.Unmarshal(msg.Data, metadata.evtName)
+	if err != nil {
+		return nil, false, err
+	}
+
+	e := event.New(
+		metadata.evtName,
+		data,
+		event.ID(metadata.evtId),
+		event.Time(metadata.evtTime),
+		event.Aggregate(metadata.aggregateId, metadata.aggregateName, metadata.aggregateVersion),
+	)
+	return e, true, nil
 }
 
 func unique[T comparable](s []T) []T {
@@ -513,6 +446,7 @@ func min[T constraints.Ordered](s []T) T {
 	}
 	return m
 }
+
 func max[T constraints.Ordered](s []T) T {
 	if len(s) == 0 {
 		var zero T
