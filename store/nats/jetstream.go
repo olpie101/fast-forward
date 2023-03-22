@@ -184,7 +184,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 		}
 	}
 
-	exp := 10 * time.Millisecond
+	exp := 50 * time.Millisecond
 	t := time.NewTimer(exp)
 	for {
 		select {
