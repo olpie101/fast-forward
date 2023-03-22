@@ -42,10 +42,20 @@ func (svc *Worker) Start(ctx context.Context) (<-chan error, error) {
 	errs := make(chan error)
 	for name, s := range svc.schedules {
 		svc.projectSvc.Register(name, s)
-		perrs, err := s.Subscribe(ctx, func(j projection.Job) error {
-			svc.logger.Infow("proj")
-			return j.Apply(ctx, svc.projection)
-		})
+		perrs, err := s.Subscribe(
+			ctx,
+			//TODO: @olpie101 create jobFunc  to abstract this away
+			//Make sure to declare that it is the implementors responsibility to
+			//call the job's Apply method
+			func(j projection.Job) error {
+				svc.logger.Debug("applying job")
+				return j.Apply(ctx, svc.projection)
+			},
+			// projection.Startup(
+			// 	projection.QueryGuard(query.Name),
+			// 	projection.Filter(),
+			// ),
+		)
 		if err != nil {
 			return nil, err
 		}
