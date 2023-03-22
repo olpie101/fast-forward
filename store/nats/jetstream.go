@@ -79,7 +79,7 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 		)
 
 		if err != nil {
-			s.logger.Errorw("err inserting events", "error", err)
+			s.logger.Errorw("err inserting events", "error", err, "subject", sub)
 			return err
 		}
 	}
