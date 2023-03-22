@@ -1,8 +1,6 @@
 package errorable
 
 import (
-	"fmt"
-
 	"github.com/modernice/goes/event"
 )
 
@@ -49,7 +47,6 @@ func (a *Base) RegisterEventHandler(eventName string, handler func(event.Event) 
 
 // ApplyEvent implements eventApplier.
 func (a *Base) ApplyEvent(evt event.Event) {
-	fmt.Println("exec handler")
 	if handler, ok := a.appliers[evt.Name()]; ok {
 		handler(evt)
 	}
