@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -96,7 +97,7 @@ func (s *Store) Find(_ context.Context, _ uuid.UUID) (event.Event, error) {
 // returned events and one for any asynchronous errors that occur during the
 // query.
 func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <-chan error, error) {
-	s.logger.Debug("query",
+	s.logger.Debugw("query",
 		"ids", q.AggregateIDs(),
 		"names", q.AggregateNames(),
 		"aggregates", len(q.Aggregates()),
@@ -156,6 +157,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 	}
 
 	if q.Times() != nil && (q.Times().Min() != time.Time{}) {
+		fmt.Println("times")
 		opts = append(opts, nats.StartTime(q.Times().Min()))
 	}
 
@@ -174,11 +176,12 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 		}
 	}
 
-	msgs := make(chan *nats.Msg, len(subjects))
+	chanSize := math.Max(float64(len(subjects)), 10)
+	msgs := make(chan *nats.Msg, int(chanSize))
 	for _, subject := range subjects {
 		_, err := s.js.ChanSubscribe(subject, msgs, opts...)
 		if err != nil {
-			s.logger.Errorw("err sub", "err", err)
+			s.logger.Errorw("err sub", "err", err, "subject", subject)
 			errs <- err
 			return
 		}
