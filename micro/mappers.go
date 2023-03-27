@@ -2,6 +2,7 @@ package micro
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/invopop/jsonschema"
@@ -14,7 +15,7 @@ func UUIDMapper(t reflect.Type) []reflect.StructField {
 		isUUID := f.Type == reflect.TypeOf(uuid.UUID{})
 		if isUUID {
 			nf := reflect.StructField{
-				Name:      jsonschema.ToSnakeCase(f.Name),
+				Name:      strings.ReplaceAll(jsonschema.ToSnakeCase(f.Name), "-", "_"),
 				PkgPath:   "",
 				Type:      reflect.TypeOf(""),
 				Tag:       `jsonschema:"format=uuid"`,
