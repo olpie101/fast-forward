@@ -181,7 +181,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 	for _, subject := range subjects {
 		_, err := s.js.ChanSubscribe(subject, msgs, opts...)
 		if err != nil {
-			s.logger.Errorw("err sub", "err", err, "subject", subject)
+			s.logger.Errorw("subscription error", "err", err, "subject", subject)
 			errs <- err
 			return
 		}
