@@ -2,12 +2,21 @@ package projection
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/modernice/goes/codec"
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/projection"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
+)
+
+type ContextKey string
+
+var (
+	ContextKeyJobName = ContextKey("name")
+	ContextKeyId      = ContextKey("id")
+	ContextKeyRunId   = ContextKey("run-id")
 )
 
 type Worker struct {
@@ -16,7 +25,10 @@ type Worker struct {
 	projectSvc *projection.Service
 	projection Projector
 	running    bool
+	onError    func(projection.Job, error)
 }
+
+var defaultOnErrorFunc = func(projection.Job, error) {}
 
 type WorkerOption func(*Worker)
 
@@ -27,6 +39,7 @@ func New(bus event.Bus, store event.Store, reg *codec.Registry, opts ...WorkerOp
 		projectSvc: projection.NewService(bus),
 		projection: nil,
 		running:    false,
+		onError:    defaultOnErrorFunc,
 	}
 	for _, v := range opts {
 		v(projector)
@@ -36,15 +49,20 @@ func New(bus event.Bus, store event.Store, reg *codec.Registry, opts ...WorkerOp
 	return projector
 }
 
-func (svc *Worker) Start(ctx context.Context) (<-chan error, error) {
+func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption) (<-chan error, error) {
 	// svc.projection.Register()
 	svc.running = true
 	errs := make(chan error)
 	for name, s := range svc.schedules {
+		jobId := uuid.New()
+		logger := svc.logger.With("job_name", name, "job_id", jobId)
 		svc.projectSvc.Register(name, s)
+		ctx = context.WithValue(ctx, ContextKeyJobName, name)
+		ctx = context.WithValue(ctx, ContextKeyId, jobId)
 		perrs, err := s.Subscribe(
 			ctx,
 			svc.projection.HandleJob,
+			opts...,
 		)
 		if err != nil {
 			return nil, err
@@ -58,10 +76,17 @@ func (svc *Worker) Start(ctx context.Context) (<-chan error, error) {
 			for {
 				select {
 				case e := <-triggerErrs:
-					errs <- errors.WithMessage(e, "trigger error occurred")
+					if err == nil {
+						continue
+					}
+					logger.Errorw("projection trigger err", "err", err)
+					errs <- fmt.Errorf("trigger error occurred: %w", e)
 				case e := <-projErrs:
-					errs <- errors.WithMessage(e, "proj error occurred")
-
+					if err == nil {
+						continue
+					}
+					logger.Errorw("projection err", "err", err)
+					errs <- fmt.Errorf("proj error occurred: %w", e)
 				}
 			}
 		}(errs, c, perrs)
