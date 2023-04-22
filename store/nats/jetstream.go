@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/event/query/version"
 	"github.com/modernice/goes/helper/pick"
+	"github.com/modernice/goes/helper/streams"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 	"golang.org/x/exp/constraints"
@@ -102,18 +104,17 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 		"names", q.AggregateNames(),
 		"aggregates", len(q.Aggregates()),
 		"event_name", q.Names(),
+		"version min", q.AggregateVersions().Min(),
+		"version max", q.AggregateVersions().Max(),
 	)
-
-	evtChan := make(chan event.Of[any])
-	errChan := make(chan error)
 
 	subjects, err := s.buildQuery(q)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	go s.query(ctx, q, subjects, evtChan, errChan)
-	return evtChan, errChan, nil
+	evts, errs := s.query(ctx, q, subjects)
+	return evts, errs, nil
 }
 
 func (s *Store) buildQuery(q event.Query) ([]string, error) {
@@ -142,9 +143,139 @@ type evtTest func(m eventMetadata) bool
 
 var defaultEvtTest = func(m eventMetadata) bool { return true }
 
-func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evts chan<- event.Event, errs chan<- error) {
-	defer close(evts)
-	defer close(errs)
+func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	errs := make(chan error, 100)
+
+	opts := natsOpts(ctx, q)
+	guard := newLimitGuard(q)
+
+	chanSize := math.Max(float64(len(subjects)), 1000)
+	cmsgs := make(chan *nats.Msg, int(chanSize))
+	s.logger.Debugw("subject list", "subs", len(subjects))
+	var wg sync.WaitGroup
+	wg.Add(len(subjects))
+	for _, subject := range subjects {
+		go s.subscribe(ctx, &wg, subject, cmsgs, errs, opts...)
+	}
+
+	wg.Wait()
+	close(cmsgs)
+	close(errs)
+
+	msgs, err := streams.Drain(
+		ctx,
+		streams.Filter(
+			streams.Map(
+				ctx,
+				cmsgs,
+				func(m *nats.Msg) event.Event {
+					e, err := s.processQueryMsg(m)
+					if err != nil {
+						errs <- err
+					}
+					return e
+				}),
+			func(e event.Event) bool { return e != nil },
+			guard.guard,
+		),
+		errs,
+	)
+
+	if err != nil {
+		errs <- err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, errs
+	default:
+		s.logger.Debugw("ctx not done")
+		break
+	}
+
+	slices.SortFunc(
+		msgs,
+		func(a event.Of[any], b event.Of[any]) bool {
+			less := false
+			for _, sorter := range q.Sortings() {
+				switch sorter.Sort {
+				case event.SortTime:
+					less = a.Time().Before(b.Time())
+				case event.SortAggregateVersion:
+					if pick.AggregateName(a) != pick.AggregateName(b) {
+						less = pick.AggregateName(a) < pick.AggregateName(b)
+						continue
+					}
+					if pick.AggregateID(a) != pick.AggregateID(b) {
+						less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
+						continue
+					}
+					less = pick.AggregateVersion(a) < pick.AggregateVersion(b)
+				case event.SortAggregateName:
+					less = pick.AggregateName(a) < pick.AggregateName(b)
+				case event.SortAggregateID:
+					less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
+				}
+				if sorter.Dir == event.SortDesc {
+					less = !less
+				}
+			}
+			return false
+		},
+	)
+
+	// for _, v := range msgs {
+	// 	s.logger.Debugw("event v", "version", pick.AggregateVersion(v), "id", pick.AggregateID(v), "ename", v.Name())
+	// }
+
+	s.logger.Debugw("total msg c", "total", len(msgs), "duration", time.Since(start))
+	return streams.New(msgs), errs
+}
+
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject string, msgs chan *nats.Msg, errs chan<- error, opts ...nats.SubOpt) {
+	defer wg.Done()
+
+	sub, err := s.js.SubscribeSync(subject, opts...)
+	if err != nil {
+		if errors.Is(err, nats.ErrNoMatchingStream) {
+			return
+		}
+		s.logger.Errorw("subscription error", "err", err, "subject", subject)
+		errs <- err
+		return
+	}
+
+	_, err = sub.ConsumerInfo()
+	if err != nil {
+		s.logger.Errorw("err getting consumer info", "err", err)
+		errs <- err
+		return
+	}
+
+	for {
+		m, err := sub.NextMsgWithContext(ctx)
+		if err != nil {
+			s.logger.Errorw("err getting next msg", "err", err)
+			errs <- err
+			return
+		}
+		msgs <- m
+		q, _, err := sub.Pending()
+		if err != nil {
+			s.logger.Errorw("err getting queue msgs count", "err", err)
+			errs <- err
+			return
+		}
+		if q == 0 {
+			break
+		}
+	}
+}
+
+func natsOpts(ctx context.Context, q event.Query) []nats.SubOpt {
 	opts := []nats.SubOpt{
 		nats.OrderedConsumer(),
 		nats.ReplayInstant(),
@@ -157,60 +288,39 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string, evt
 	}
 
 	if q.Times() != nil && (q.Times().Min() != time.Time{}) {
-		fmt.Println("times")
 		opts = append(opts, nats.StartTime(q.Times().Min()))
 	}
+	return opts
+}
 
-	maxVerTest := defaultEvtTest
-	maxTimeTest := defaultEvtTest
+type limitGuard struct {
+	versionGuard func(e event.Event) bool
+	maxTimeGuard func(e event.Event) bool
+}
+
+func (g limitGuard) guard(e event.Event) bool {
+	return g.maxTimeGuard(e) && g.versionGuard(e)
+}
+
+func newLimitGuard(q event.Query) limitGuard {
+	guard := limitGuard{
+		versionGuard: func(e event.Event) bool { return true },
+		maxTimeGuard: func(e event.Event) bool { return true },
+	}
 
 	if q.AggregateVersions() != nil && len(q.AggregateVersions().Max()) > 0 {
-		maxVerTest = func(m eventMetadata) bool {
-			return m.aggregateVersion <= max(q.AggregateVersions().Max())
+		guard.versionGuard = func(e event.Event) bool {
+			return pick.AggregateVersion(e) <= max(q.AggregateVersions().Max())
 		}
 	}
 
 	if q.Times() != nil && (q.Times().Max() != time.Time{}) {
-		maxTimeTest = func(m eventMetadata) bool {
-			return m.evtTime.Before(q.Times().Max().Add(time.Microsecond))
+		guard.maxTimeGuard = func(e event.Event) bool {
+			return e.Time().Before(q.Times().Max().Add(time.Microsecond))
 		}
 	}
 
-	chanSize := math.Max(float64(len(subjects)), 10)
-	msgs := make(chan *nats.Msg, int(chanSize))
-	for _, subject := range subjects {
-		_, err := s.js.ChanSubscribe(subject, msgs, opts...)
-		if err != nil {
-			s.logger.Errorw("subscription error", "err", err, "subject", subject)
-			errs <- err
-			return
-		}
-	}
-
-	exp := 50 * time.Millisecond
-	t := time.NewTimer(exp)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case m := <-msgs:
-			test := func(md eventMetadata) bool {
-				return maxVerTest(md) && maxTimeTest(md)
-			}
-			evt, ok, err := s.processQueryMsg(m, test)
-			if err != nil {
-				errs <- err
-			}
-			if !ok {
-				continue
-			}
-
-			evts <- evt
-			t.Reset(exp)
-		case <-t.C:
-			return
-		}
-	}
+	return guard
 }
 
 func buildAggregatesQuery(names []string) []string {
@@ -360,10 +470,17 @@ func subjectToValues(sub string) (aggregateName string, id uuid.UUID, version in
 	return parts[0], id, version, nil
 }
 
+// TODO: @olpie101 remove this requirement. It locks implementation unnecessarily
 func eventSubFromEvent(evtName string) (string, error) {
 	parts := strings.Split(evtName, ".")
+	// jobs cache short event names because of this implementation
+	// this is a temporary fix
+	if len(parts) == 1 {
+		return evtName, nil
+	}
+
 	if len(parts) != 4 {
-		return "", errors.New("incorrect event name format")
+		return "", fmt.Errorf("incorrect event name format: %s", evtName)
 	}
 	return parts[3], nil
 }
@@ -398,20 +515,15 @@ func getMetadata(h nats.Header, sub string) (eventMetadata, error) {
 	}, nil
 }
 
-func (s *Store) processQueryMsg(msg *nats.Msg, t evtTest) (event.Event, bool, error) {
+func (s *Store) processQueryMsg(msg *nats.Msg) (event.Event, error) {
 	metadata, err := getMetadata(msg.Header, msg.Subject)
 	if err != nil {
-		return nil, false, err
-	}
-
-	ok := t(metadata)
-	if !ok {
-		return nil, false, nil
+		return nil, err
 	}
 
 	data, err := s.enc.Unmarshal(msg.Data, metadata.evtName)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	e := event.New(
@@ -421,7 +533,7 @@ func (s *Store) processQueryMsg(msg *nats.Msg, t evtTest) (event.Event, bool, er
 		event.Time(metadata.evtTime),
 		event.Aggregate(metadata.aggregateId, metadata.aggregateName, metadata.aggregateVersion),
 	)
-	return e, true, nil
+	return e, nil
 }
 
 func unique[T comparable](s []T) []T {
