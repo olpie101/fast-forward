@@ -119,13 +119,6 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 
 func (s *Store) buildQuery(q event.Query) ([]string, error) {
 	names := q.Names()
-	for i := 0; i < len(names); i++ {
-		name, err := eventSubFromEvent(names[i])
-		if err != nil {
-			return nil, err
-		}
-		names[i] = name
-	}
 	subjects := buildEventNameQuery(
 		buildAggregateVersionsQuery(
 			buildAggregateIdsQuery(
@@ -248,7 +241,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject strin
 		return
 	}
 
-	_, err = sub.ConsumerInfo()
+	info, err := sub.ConsumerInfo()
 	if err != nil {
 		s.logger.Errorw("err getting consumer info", "err", err)
 		errs <- err
@@ -395,7 +388,7 @@ func buildEventNameQuery(versionQueries []string, names []string) []string {
 	out := make([]string, 0, len(versionQueries)*len(names))
 	for _, aggName := range versionQueries {
 		for _, name := range names {
-			out = append(out, fmt.Sprintf("%s.%s", aggName, name))
+			out = append(out, fmt.Sprintf("%s.%s", aggName, normaliseEventName(name)))
 		}
 	}
 
@@ -444,10 +437,7 @@ func parseAggregateValues(h nats.Header) (uuid.UUID, string, int, error) {
 }
 
 func subjectFunc(aggregateName string, id uuid.UUID, version int, eventName string) (string, error) {
-	eventName, err := eventSubFromEvent(eventName)
-	if err != nil {
-		return "", err
-	}
+	eventName = normaliseEventName(eventName)
 
 	return fmt.Sprintf("es.%s.%s.%d.%s", aggregateName, id.String(), version, eventName), nil
 }
@@ -470,20 +460,24 @@ func subjectToValues(sub string) (aggregateName string, id uuid.UUID, version in
 	return parts[0], id, version, nil
 }
 
-// TODO: @olpie101 remove this requirement. It locks implementation unnecessarily
-func eventSubFromEvent(evtName string) (string, error) {
-	parts := strings.Split(evtName, ".")
-	// jobs cache short event names because of this implementation
-	// this is a temporary fix
-	if len(parts) == 1 {
-		return evtName, nil
-	}
-
-	if len(parts) != 4 {
-		return "", fmt.Errorf("incorrect event name format: %s", evtName)
-	}
-	return parts[3], nil
+func normaliseEventName(name string) string {
+	return strings.ReplaceAll(name, ".", "_")
 }
+
+// // TODO: @olpie101 remove this requirement. It locks implementation unnecessarily
+// func eventSubFromEvent(evtName string) (string, error) {
+// 	parts := strings.Split(evtName, ".")
+// 	// jobs cache short event names because of this implementation
+// 	// this is a temporary fix
+// 	if len(parts) == 1 {
+// 		return evtName, nil
+// 	}
+
+// 	if len(parts) != 4 {
+// 		return "", fmt.Errorf("incorrect event name format: %s", evtName)
+// 	}
+// 	return parts[3], nil
+// }
 
 type eventMetadata struct {
 	evtId            uuid.UUID
