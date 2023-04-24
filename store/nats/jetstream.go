@@ -156,10 +156,12 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	wg.Wait()
 	close(cmsgs)
-	close(errs)
+
+	drainCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 
 	msgs, err := streams.Drain(
-		ctx,
+		drainCtx,
 		streams.Filter(
 			streams.Map(
 				ctx,
@@ -177,9 +179,11 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		errs,
 	)
 
-	if err != nil {
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		errs <- err
 	}
+
+	close(errs)
 
 	select {
 	case <-ctx.Done():
@@ -245,6 +249,11 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject strin
 	if err != nil {
 		s.logger.Errorw("err getting consumer info", "err", err)
 		errs <- err
+		return
+	}
+
+	// Empty stream of events
+	if info.NumPending == 0 && info.AckFloor.Consumer == 0 {
 		return
 	}
 
