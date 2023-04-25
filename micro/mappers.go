@@ -1,6 +1,7 @@
 package micro
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 
@@ -14,11 +15,14 @@ func UUIDMapper(t reflect.Type) []reflect.StructField {
 		f := t.Field(i)
 		isUUID := f.Type == reflect.TypeOf(uuid.UUID{})
 		if isUUID {
+			extraTagVals, _ := f.Tag.Lookup("jsonschema")
 			nf := reflect.StructField{
 				Name:      strings.ReplaceAll(jsonschema.ToSnakeCase(f.Name), "-", "_"),
 				PkgPath:   "",
 				Type:      reflect.TypeOf(""),
-				Tag:       `jsonschema:"format=uuid"`,
+				Tag:       reflect.StructTag(fmt.Sprintf(`%s jsonschema:"%s,format=uuid"`, f.Tag, extraTagVals)),
+				Offset:    0,
+				Index:     []int{},
 				Anonymous: false,
 			}
 			out = append(out, nf)
