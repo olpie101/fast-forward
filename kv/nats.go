@@ -235,7 +235,11 @@ type StringValue struct {
 }
 
 func (v *StringValue) MarshalValue() ([]byte, error) {
-	return []byte(v.Value), nil
+	var out string
+	if v != nil {
+		out = v.Value
+	}
+	return []byte(out), nil
 }
 
 func (v *StringValue) UnmarshalValue(b []byte) error {

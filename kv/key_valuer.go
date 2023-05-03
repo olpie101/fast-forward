@@ -1,6 +1,10 @@
 package kv
 
-import "github.com/nats-io/nats.go"
+import (
+	"fmt"
+
+	"github.com/nats-io/nats.go"
+)
 
 func bucket(conn *nats.Conn, name string) (nats.KeyValue, error) {
 	jsc, err := conn.JetStream()
@@ -14,7 +18,7 @@ func bucket(conn *nats.Conn, name string) (nats.KeyValue, error) {
 func BucketKeyValuer[T MarshalerUnmarshaler](conn *nats.Conn, name string) (KeyValuer[T], error) {
 	bucket, err := bucket(conn, name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("kv: %s - %w", name, err)
 	}
 	return New[T](bucket), nil
 }
