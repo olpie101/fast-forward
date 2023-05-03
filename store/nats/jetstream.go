@@ -145,8 +145,16 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	cmsgs, push, cls := streams.NewConcurrentContext[*nats.Msg](ctx)
 
-	subErrs := make(chan error, 1)
 	opErrs := make(chan error, 1)
+	defer close(opErrs)
+
+	subErrs := make(chan error, 1)
+	go func() {
+		wg.Wait()
+		cls()
+		close(subErrs)
+	}()
+
 	errs, stop := streams.FanIn(opErrs, subErrs)
 	defer stop()
 
@@ -154,35 +162,10 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		go s.subscribe(ctx, &wg, subject, push, subErrs, opts...)
 	}
 
-	go func() {
-		wg.Wait()
-		cls()
-		close(subErrs)
-	}()
-
-	msgs, err := streams.All(
-		streams.Filter(
-			streams.Map(
-				ctx,
-				cmsgs,
-				func(m *nats.Msg) event.Event {
-					e, err := s.processQueryMsg(m)
-					if err != nil {
-						opErrs <- err
-					}
-					return e
-				}),
-			func(e event.Event) bool { return e != nil },
-			guard.guard,
-		),
-		subErrs,
-	)
-
+	msgs, err := s.collect(ctx, cmsgs, subErrs, guard)
 	if err != nil {
 		opErrs <- err
 	}
-
-	close(opErrs)
 
 	select {
 	case <-ctx.Done():
@@ -192,40 +175,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		break
 	}
 
-	slices.SortFunc(
-		msgs,
-		func(a event.Of[any], b event.Of[any]) bool {
-			less := false
-			for _, sorter := range q.Sortings() {
-				switch sorter.Sort {
-				case event.SortTime:
-					less = a.Time().Before(b.Time())
-				case event.SortAggregateVersion:
-					if pick.AggregateName(a) != pick.AggregateName(b) {
-						less = pick.AggregateName(a) < pick.AggregateName(b)
-						continue
-					}
-					if pick.AggregateID(a) != pick.AggregateID(b) {
-						less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
-						continue
-					}
-					less = pick.AggregateVersion(a) < pick.AggregateVersion(b)
-				case event.SortAggregateName:
-					less = pick.AggregateName(a) < pick.AggregateName(b)
-				case event.SortAggregateID:
-					less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
-				}
-				if sorter.Dir == event.SortDesc {
-					less = !less
-				}
-			}
-			return false
-		},
-	)
-
-	// for _, v := range msgs {
-	// 	s.logger.Debugw("event v", "version", pick.AggregateVersion(v), "id", pick.AggregateID(v), "ename", v.Name())
-	// }
+	applySortings(msgs, q.Sortings())
 
 	s.logger.Debugw("total msg c", "total", len(msgs), "duration", time.Since(start))
 	return streams.New(msgs), errs
@@ -279,6 +229,59 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject strin
 			break
 		}
 	}
+}
+
+func (s *Store) collect(ctx context.Context, msgs <-chan *nats.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
+	return streams.All(
+		streams.Filter(
+			streams.Map(
+				ctx,
+				msgs,
+				func(m *nats.Msg) event.Event {
+					e, err := s.processQueryMsg(m)
+					if err != nil {
+						errs <- err
+					}
+					return e
+				}),
+			func(e event.Event) bool { return e != nil },
+			g.guard,
+		),
+		errs,
+	)
+}
+
+func applySortings(evts []event.Event, sortings []event.SortOptions) {
+	slices.SortFunc(
+		evts,
+		func(a event.Of[any], b event.Of[any]) bool {
+			less := false
+			for _, sorter := range sortings {
+				switch sorter.Sort {
+				case event.SortTime:
+					less = a.Time().Before(b.Time())
+				case event.SortAggregateVersion:
+					if pick.AggregateName(a) != pick.AggregateName(b) {
+						less = pick.AggregateName(a) < pick.AggregateName(b)
+						continue
+					}
+					if pick.AggregateID(a) != pick.AggregateID(b) {
+						less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
+						continue
+					}
+					less = pick.AggregateVersion(a) < pick.AggregateVersion(b)
+				case event.SortAggregateName:
+					less = pick.AggregateName(a) < pick.AggregateName(b)
+				case event.SortAggregateID:
+					less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
+				}
+				if sorter.Dir == event.SortDesc {
+					less = !less
+				}
+			}
+			return false
+		},
+	)
 }
 
 func natsOpts(ctx context.Context, q event.Query) []nats.SubOpt {
@@ -429,24 +432,6 @@ func parseEventValues(h nats.Header) (uuid.UUID, string, time.Time, error) {
 	}
 
 	return id, evtName, t, nil
-}
-
-func parseAggregateValues(h nats.Header) (uuid.UUID, string, int, error) {
-	aggName := h.Get("aggregate-name")
-	aggId := h.Get("aggregate-id")
-	aggVersion := h.Get("aggregate-version")
-
-	id, err := uuid.Parse(aggId)
-	if err != nil {
-		return uuid.Nil, "", 0, err
-	}
-
-	ver, err := strconv.Atoi(aggVersion)
-	if err != nil {
-		return uuid.Nil, "", 0, err
-	}
-
-	return id, aggName, ver, nil
 }
 
 func subjectFunc(aggregateName string, id uuid.UUID, version int, eventName string) (string, error) {
