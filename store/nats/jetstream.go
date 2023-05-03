@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -132,36 +131,36 @@ func (s *Store) buildQuery(q event.Query) ([]string, error) {
 	return subjects, nil
 }
 
-type evtTest func(m eventMetadata) bool
-
-var defaultEvtTest = func(m eventMetadata) bool { return true }
-
 func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	start := time.Now()
-	errs := make(chan error, 100)
 
 	opts := natsOpts(ctx, q)
 	guard := newLimitGuard(q)
 
-	chanSize := math.Max(float64(len(subjects)), 1000)
-	cmsgs := make(chan *nats.Msg, int(chanSize))
 	s.logger.Debugw("subject list", "subs", len(subjects))
 	var wg sync.WaitGroup
 	wg.Add(len(subjects))
+
+	cmsgs, push, cls := streams.NewConcurrentContext[*nats.Msg](ctx)
+
+	subErrs := make(chan error, 1)
+	opErrs := make(chan error, 1)
+	errs, stop := streams.FanIn(opErrs, subErrs)
+	defer stop()
+
 	for _, subject := range subjects {
-		go s.subscribe(ctx, &wg, subject, cmsgs, errs, opts...)
+		go s.subscribe(ctx, &wg, subject, push, subErrs, opts...)
 	}
 
-	wg.Wait()
-	close(cmsgs)
+	go func() {
+		wg.Wait()
+		cls()
+		close(subErrs)
+	}()
 
-	drainCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	msgs, err := streams.Drain(
-		drainCtx,
+	msgs, err := streams.All(
 		streams.Filter(
 			streams.Map(
 				ctx,
@@ -169,21 +168,21 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 				func(m *nats.Msg) event.Event {
 					e, err := s.processQueryMsg(m)
 					if err != nil {
-						errs <- err
+						opErrs <- err
 					}
 					return e
 				}),
 			func(e event.Event) bool { return e != nil },
 			guard.guard,
 		),
-		errs,
+		subErrs,
 	)
 
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		errs <- err
+	if err != nil {
+		opErrs <- err
 	}
 
-	close(errs)
+	close(opErrs)
 
 	select {
 	case <-ctx.Done():
@@ -232,7 +231,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	return streams.New(msgs), errs
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject string, msgs chan *nats.Msg, errs chan<- error, opts ...nats.SubOpt) {
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject string, push func(...*nats.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
 	defer wg.Done()
 
 	sub, err := s.js.SubscribeSync(subject, opts...)
@@ -264,7 +263,12 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject strin
 			errs <- err
 			return
 		}
-		msgs <- m
+		err = push(m)
+		if err != nil {
+			s.logger.Errorw("err pushing next msg", "err", err)
+			errs <- err
+			return
+		}
 		q, _, err := sub.Pending()
 		if err != nil {
 			s.logger.Errorw("err getting queue msgs count", "err", err)
@@ -472,21 +476,6 @@ func subjectToValues(sub string) (aggregateName string, id uuid.UUID, version in
 func normaliseEventName(name string) string {
 	return strings.ReplaceAll(name, ".", "_")
 }
-
-// // TODO: @olpie101 remove this requirement. It locks implementation unnecessarily
-// func eventSubFromEvent(evtName string) (string, error) {
-// 	parts := strings.Split(evtName, ".")
-// 	// jobs cache short event names because of this implementation
-// 	// this is a temporary fix
-// 	if len(parts) == 1 {
-// 		return evtName, nil
-// 	}
-
-// 	if len(parts) != 4 {
-// 		return "", fmt.Errorf("incorrect event name format: %s", evtName)
-// 	}
-// 	return parts[3], nil
-// }
 
 type eventMetadata struct {
 	evtId            uuid.UUID
