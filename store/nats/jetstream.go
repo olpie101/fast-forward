@@ -132,7 +132,7 @@ func (s *Store) buildQuery(q event.Query) ([]string, error) {
 }
 
 func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	subCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	start := time.Now()
 
@@ -143,7 +143,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	var wg sync.WaitGroup
 	wg.Add(len(subjects))
 
-	cmsgs, push, cls := streams.NewConcurrentContext[*nats.Msg](ctx)
+	cmsgs, push, cls := streams.NewConcurrentContext[*nats.Msg](subCtx)
 
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
@@ -152,6 +152,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	go func() {
 		wg.Wait()
 		cls()
+		cancel()
 		close(subErrs)
 	}()
 
@@ -159,7 +160,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	defer stop()
 
 	for _, subject := range subjects {
-		go s.subscribe(ctx, &wg, subject, push, subErrs, opts...)
+		go s.subscribe(subCtx, &wg, subject, push, subErrs, opts...)
 	}
 
 	msgs, err := s.collect(ctx, cmsgs, subErrs, guard)
@@ -348,8 +349,8 @@ func buildAggregateIdsQuery(aggQueries []string, ids []uuid.UUID) []string {
 	if len(ids) == 0 {
 		for i := 0; i < len(aggQueries); i++ {
 			aggQueries[i] = fmt.Sprintf("%s.*", aggQueries[i])
-			return aggQueries
 		}
+		return aggQueries
 	}
 
 	out := make([]string, 0, len(aggQueries)*len(ids))
