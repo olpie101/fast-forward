@@ -4,10 +4,18 @@ import (
 	"reflect"
 
 	"github.com/invopop/jsonschema"
-	"github.com/nats-io/nats.go/micro"
 )
 
-func GenerateSchema(reflector jsonschema.Reflector, req interface{}, res interface{}) (*micro.Schema, error) {
+type Schema struct {
+	Request  string `json:"request"`
+	Response string `json:"response"`
+}
+
+func GenerateJsonSchema(reflector jsonschema.Reflector, req interface{}, res interface{}) (*Schema, error) {
+	return generateJsonSchema(reflector, req, res)
+}
+
+func generateJsonSchema(reflector jsonschema.Reflector, req interface{}, res interface{}) (*Schema, error) {
 	reqSchema, err := createSchema(reflector, req)
 	if err != nil {
 		return nil, err
@@ -18,7 +26,7 @@ func GenerateSchema(reflector jsonschema.Reflector, req interface{}, res interfa
 		return nil, err
 	}
 
-	return &micro.Schema{
+	return &Schema{
 		Request:  string(reqSchema),
 		Response: string(resSchema),
 	}, nil
