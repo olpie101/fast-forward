@@ -141,7 +141,7 @@ func WithJsonSchema(reflector jsonschema.Reflector, req interface{}, res interfa
 		if e.metadata == nil {
 			e.metadata = make(map[string]string)
 		}
-		schema, err := generateJsonSchema(reflector, res, req)
+		schema, err := generateJsonSchema(reflector, req, res)
 		if err != nil {
 			return errors.Wrap(err, "unable to generate schema")
 		}
