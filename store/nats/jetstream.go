@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,9 +17,16 @@ import (
 	"github.com/modernice/goes/helper/pick"
 	"github.com/modernice/goes/helper/streams"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
+)
+
+type ContextKey string
+
+var (
+	ContextKeyAggregates = ContextKey("aggregates")
 )
 
 var (
@@ -30,18 +38,38 @@ type EncodingRegisterer interface {
 	Map() map[string]func() any
 }
 
-type Store struct {
-	js     nats.JetStreamContext
-	enc    EncodingRegisterer
-	logger *zap.SugaredLogger
+type StreamMapper struct {
+	AggregateName string
+	EventName     string
+	StreamName    string
 }
 
-func New(js nats.JetStreamContext, enc EncodingRegisterer, logger *zap.SugaredLogger) *Store {
+type Store struct {
+	js              jetstream.JetStream
+	enc             EncodingRegisterer
+	logger          *zap.SugaredLogger
+	encMap          map[string]string
+	aggStreamMapper map[string]string
+	evtStreamMapper map[string][]string
+}
+
+func New(js jetstream.JetStream, enc EncodingRegisterer, logger *zap.SugaredLogger) *Store {
 	return &Store{
-		js:     js,
-		enc:    enc,
-		logger: logger,
+		js:              js,
+		enc:             enc,
+		logger:          logger,
+		encMap:          generateEncodingMap(enc),
+		aggStreamMapper: map[string]string{},
+		evtStreamMapper: map[string][]string{},
 	}
+}
+
+func generateEncodingMap(enc EncodingRegisterer) map[string]string {
+	out := make(map[string]string, len(enc.Map()))
+	for k := range enc.Map() {
+		out[normaliseEventName(k)] = k
+	}
+	return out
 }
 
 // Insert inserts events into the store.
@@ -70,12 +98,13 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 			Data:    b,
 		}
 
-		opts := []nats.PubOpt{
-			nats.MsgId(evt.ID().String()),
-			nats.ExpectLastSequencePerSubject(0),
+		opts := []jetstream.PublishOpt{
+			jetstream.WithMsgID(evt.ID().String()),
+			jetstream.WithExpectLastSequencePerSubject(0),
 		}
 
 		_, err = s.js.PublishMsg(
+			ctx,
 			msg,
 			opts...,
 		)
@@ -107,13 +136,69 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 		"version max", q.AggregateVersions().Max(),
 	)
 
+	// streams, err := s.identifyStreams(q.AggregateNames(), q.Names())
+
 	subjects, err := s.buildQuery(q)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	evts, errs := s.query(ctx, q, subjects)
+	evts, errs, err := s.query(ctx, q, subjects)
+	if err != nil {
+		return nil, nil, err
+	}
 	return evts, errs, nil
+}
+
+func (s *Store) IdentifyStreams(ctx context.Context, aggregateNames, evtNames []string) error {
+	err := s.identifyStreams(ctx, aggregateNames, evtNames)
+	return err
+}
+
+func (s *Store) identifyStreams(ctx context.Context, aggregateNames, evtNames []string) error {
+	for _, a := range aggregateNames {
+		if _, ok := s.aggStreamMapper[a]; ok {
+			//already identified
+			continue
+		}
+
+		subject := fmt.Sprintf("es.%s.*.*.*", a)
+		snl := s.js.StreamNames(ctx, jetstream.WithStreamListSubject(subject))
+		if snl.Err() != nil {
+			return snl.Err()
+		}
+		names, err := streams.Drain(ctx, snl.Name())
+		if snl.Err() != nil {
+			return err
+		}
+		if len(names) == 0 {
+			return fmt.Errorf("no stream for aggregate (%s)", a)
+		}
+		s.aggStreamMapper[a] = names[0]
+	}
+
+	for _, e := range evtNames {
+		normalisedEvt := normaliseEventName(e)
+		if _, ok := s.evtStreamMapper[normalisedEvt]; ok {
+			//already identified
+			continue
+		}
+		subject := fmt.Sprintf("es.*.*.*.%s", normalisedEvt)
+		snl := s.js.StreamNames(ctx, jetstream.WithStreamListSubject(subject))
+		if snl.Err() != nil {
+			return snl.Err()
+		}
+		names, err := streams.Drain(ctx, snl.Name())
+		if snl.Err() != nil {
+			return err
+		}
+		if len(names) == 0 {
+			return fmt.Errorf("no stream for event (%s)", e)
+		}
+		s.evtStreamMapper[normalisedEvt] = names
+	}
+
+	return nil
 }
 
 func (s *Store) buildQuery(q event.Query) ([]string, error) {
@@ -131,36 +216,52 @@ func (s *Store) buildQuery(q event.Query) ([]string, error) {
 	return subjects, nil
 }
 
-func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error) {
+func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error, error) {
 	subCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	start := time.Now()
 
+	err := s.identifyStreams(ctx, q.AggregateNames(), q.Names())
+	if err != nil {
+		return nil, nil, err
+	}
+
 	opts := natsOpts(ctx, q)
 	guard := newLimitGuard(q)
 
-	s.logger.Debugw("subject list", "subs", len(subjects))
-	var wg sync.WaitGroup
-	wg.Add(len(subjects))
-
-	cmsgs, push, cls := streams.NewConcurrentContext[*nats.Msg](subCtx)
+	s.logger.Debugw("subject list", "subs", subjects)
 
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
-
 	subErrs := make(chan error, 1)
+
+	errs := streams.FanInContext(ctx, opErrs, subErrs)
+
+	groups := make(map[string][]string)
+	for _, subject := range subjects {
+		streams, err := s.streamFunc(subject)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for _, name := range streams {
+			groups[name] = append(groups[name], subject)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(groups))
+
+	cmsgs := make(chan jetstream.Msg, 200)
+	push := streams.ConcurrentContext(subCtx, cmsgs)
 	go func() {
 		wg.Wait()
-		cls()
-		cancel()
+		close(cmsgs)
 		close(subErrs)
 	}()
 
-	errs, stop := streams.FanIn(opErrs, subErrs)
-	defer stop()
-
-	for _, subject := range subjects {
-		go s.subscribe(subCtx, &wg, subject, push, subErrs, opts...)
+	for stream, subjects := range groups {
+		go s.subscribe(subCtx, &wg, stream, subjects, push, subErrs, opts...)
 	}
 
 	msgs, err := s.collect(ctx, cmsgs, subErrs, guard)
@@ -169,8 +270,8 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	}
 
 	select {
-	case <-ctx.Done():
-		return nil, errs
+	case <-subCtx.Done():
+		return nil, errs, nil
 	default:
 		s.logger.Debugw("ctx not done")
 		break
@@ -179,66 +280,94 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	applySortings(msgs, q.Sortings())
 
 	s.logger.Debugw("total msg c", "total", len(msgs), "duration", time.Since(start))
-	return streams.New(msgs), errs
+	return streams.New(msgs), errs, nil
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, subject string, push func(...*nats.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
 	defer wg.Done()
 
-	sub, err := s.js.SubscribeSync(subject, opts...)
-	if err != nil {
-		if errors.Is(err, nats.ErrNoMatchingStream) {
-			return
-		}
-		s.logger.Errorw("subscription error", "err", err, "subject", subject)
-		errs <- err
-		return
-	}
+	var subWg sync.WaitGroup
+	subWg.Add(len(subjects))
 
-	info, err := sub.ConsumerInfo()
-	if err != nil {
-		s.logger.Errorw("err getting consumer info", "err", err)
-		errs <- err
-		return
-	}
+	// TODO: simplify this using `FilterSubjects` when nats 2.10 is out
+	for _, sub := range subjects {
+		go func(sub string, wg *sync.WaitGroup) {
+			defer wg.Done()
+			c, err := s.js.CreateOrUpdateConsumer(
+				ctx,
+				stream,
+				jetstream.ConsumerConfig{
+					DeliverPolicy:     jetstream.DeliverAllPolicy,
+					AckPolicy:         jetstream.AckExplicitPolicy,
+					FilterSubject:     sub,
+					ReplayPolicy:      jetstream.ReplayInstantPolicy,
+					InactiveThreshold: 10 * time.Millisecond,
+					MemoryStorage:     true,
+					// FilterSubjects:     subjects,
+				},
+			)
 
-	// Empty stream of events
-	if info.NumPending == 0 && info.AckFloor.Consumer == 0 {
-		return
-	}
+			if err != nil {
+				s.logger.Errorw("consumer error", "err", err)
+				errs <- err
+				return
+			}
 
-	for {
-		m, err := sub.NextMsgWithContext(ctx)
-		if err != nil {
-			s.logger.Errorw("err getting next msg", "err", err)
-			errs <- err
-			return
-		}
-		err = push(m)
-		if err != nil {
-			s.logger.Errorw("err pushing next msg", "err", err)
-			errs <- err
-			return
-		}
-		q, _, err := sub.Pending()
-		if err != nil {
-			s.logger.Errorw("err getting queue msgs count", "err", err)
-			errs <- err
-			return
-		}
-		if q == 0 {
-			break
-		}
+			expected := c.CachedInfo().NumPending
+			if expected == 0 {
+				return
+			}
+
+			if err != nil {
+				s.logger.Errorw("consumer error", "err", err)
+				errs <- err
+				return
+			}
+
+			it, err := c.Messages()
+			defer func() {
+				go it.Stop()
+			}()
+			if err != nil {
+				log.Fatal(err)
+			}
+			var count uint64 = 0
+			for {
+				msg, err := it.Next()
+				if err != nil {
+					s.logger.Errorw("err getting next msg", "err", err)
+					errs <- err
+					break
+				}
+				err = push(msg)
+				if err != nil {
+					s.logger.Errorw("err pushing next msg", "err", err)
+					errs <- err
+					break
+				}
+				err = msg.Ack()
+				if err != nil {
+					s.logger.Errorw("err acking msg", "err", err)
+					errs <- err
+					break
+				}
+				count++
+				if count >= expected {
+					break
+				}
+			}
+		}(sub, &subWg)
 	}
+	subWg.Wait()
 }
 
-func (s *Store) collect(ctx context.Context, msgs <-chan *nats.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
+func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
 	return streams.All(
 		streams.Filter(
 			streams.Map(
 				ctx,
 				msgs,
-				func(m *nats.Msg) event.Event {
+				func(m jetstream.Msg) event.Event {
 					e, err := s.processQueryMsg(m)
 					if err != nil {
 						errs <- err
@@ -250,6 +379,22 @@ func (s *Store) collect(ctx context.Context, msgs <-chan *nats.Msg, errs chan er
 		),
 		errs,
 	)
+}
+
+func (s *Store) streamFunc(subject string) ([]string, error) {
+	parts := strings.Split(subject, ".")
+	hasAggregate := parts[1] != "*"
+	hasEvent := parts[4] != "*"
+	s.logger.Debugw("streamFunc", "subject", subject, "hasAggregate", hasAggregate, "hasEvent", hasEvent, "aggMap", s.evtStreamMapper)
+	if hasAggregate {
+		return []string{s.aggStreamMapper[parts[1]]}, nil
+	}
+
+	if hasEvent {
+		return s.evtStreamMapper[parts[4]], nil
+	}
+
+	return nil, fmt.Errorf("subject is not supported (%s)", subject)
 }
 
 func applySortings(evts []event.Event, sortings []event.SortOptions) {
@@ -292,6 +437,7 @@ func natsOpts(ctx context.Context, q event.Query) []nats.SubOpt {
 		nats.Context(ctx),
 	}
 
+	// TODO: this is incorrect. The sequences will not match
 	if q.AggregateVersions() != nil && len(q.AggregateVersions().Min()) > 0 {
 		min := min(q.AggregateVersions().Min())
 		opts = append(opts, nats.StartSequence(uint64(min)))
@@ -493,13 +639,21 @@ func getMetadata(h nats.Header, sub string) (eventMetadata, error) {
 	}, nil
 }
 
-func (s *Store) processQueryMsg(msg *nats.Msg) (event.Event, error) {
-	metadata, err := getMetadata(msg.Header, msg.Subject)
+func (s *Store) processQueryMsg(msg jetstream.Msg) (event.Event, error) {
+	metadata, err := getMetadata(msg.Headers(), msg.Subject())
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := s.enc.Unmarshal(msg.Data, metadata.evtName)
+	if streams, ok := s.evtStreamMapper[eventFromSubject(msg.Subject())]; !ok || (ok && len(streams) > 1) {
+		md, err := msg.Metadata()
+		if err != nil {
+			return nil, err
+		}
+		s.evtStreamMapper[eventFromSubject(msg.Subject())] = []string{md.Stream}
+	}
+
+	data, err := s.enc.Unmarshal(msg.Data(), metadata.evtName)
 	if err != nil {
 		return nil, err
 	}
@@ -552,4 +706,8 @@ func max[T constraints.Ordered](s []T) T {
 		}
 	}
 	return m
+}
+
+func eventFromSubject(subject string) string {
+	return strings.Split(subject, ".")[4]
 }
