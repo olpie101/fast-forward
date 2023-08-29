@@ -301,7 +301,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 					AckPolicy:         jetstream.AckExplicitPolicy,
 					FilterSubject:     sub,
 					ReplayPolicy:      jetstream.ReplayInstantPolicy,
-					InactiveThreshold: 10 * time.Millisecond,
+					InactiveThreshold: 300 * time.Millisecond,
 					MemoryStorage:     true,
 					// FilterSubjects:     subjects,
 				},
