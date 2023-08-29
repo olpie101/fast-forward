@@ -25,8 +25,8 @@ github.com/klauspost/compress v1.16.5 h1:IFV2oUNUzZaz+XyusxpLzpzS8Pt5rh0Z16For/d
 github.com/klauspost/compress v1.16.5/go.mod h1:ntbaceVETuRiXiv4DpjP66DpAtAGkEQskQzEyD//IeE=
 github.com/minio/highwayhash v1.0.2 h1:Aak5U0nElisjDCfPSG79Tgzkn2gl66NxOMspRrKnA/g=
 github.com/minio/highwayhash v1.0.2/go.mod h1:BQskDq+xkJ12lmlUUi7U0M5Swg3EWR+dLTk+kldvVxY=
-github.com/modernice/goes v0.3.6 h1:bXxh8hi0UC5cL4sYWLTwkcG8VF+1UmJpqhqh2c1Uo/o=
-github.com/modernice/goes v0.3.6/go.mod h1:e6D5RcrubtsI2DiBgXZSw8L4sYOP7TDpU+62433D0Ls=
+github.com/modernice/goes v0.3.5 h1:NXlyoIgkKLuo74zDduaS1GIjdCjPd66ZXUMcJanvZEo=
+github.com/modernice/goes v0.3.5/go.mod h1:asGDG7DqyIRWR0dn5gM+rPMFj+qSLGfXXJVWZRX8TgE=
 github.com/nats-io/jwt/v2 v2.5.0 h1:WQQ40AAlqqfx+f6ku+i0pOVm+ASirD4fUh+oQsiE9Ak=
 github.com/nats-io/jwt/v2 v2.5.0/go.mod h1:24BeQtRwxRV8ruvC4CojXlx/WQ/VjuwlYiH+vu/+ibI=
 github.com/nats-io/nats-server/v2 v2.7.4 h1:c+BZJ3rGzUKCBIM4IXO8uNT2u1vajGbD1kPA6wqCEaM=
