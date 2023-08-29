@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modernice/goes/codec"
 	"github.com/modernice/goes/event"
+	"github.com/modernice/goes/helper/streams"
 	"github.com/modernice/goes/projection"
 	"go.uber.org/zap"
 )
@@ -21,9 +22,8 @@ var (
 
 type Worker struct {
 	logger     *zap.SugaredLogger
-	schedules  Schedules
 	projectSvc *projection.Service
-	projection Projector
+	projector  Projector
 	running    bool
 	onError    func(projection.Job, error)
 }
@@ -32,64 +32,65 @@ var defaultOnErrorFunc = func(projection.Job, error) {}
 
 type WorkerOption func(*Worker)
 
-func New(bus event.Bus, store event.Store, reg *codec.Registry, opts ...WorkerOption) *Worker {
-	projector := &Worker{
+func New(projector Projector, bus event.Bus, reg *codec.Registry, opts ...WorkerOption) *Worker {
+	worker := &Worker{
 		logger:     zap.NewNop().Sugar(),
-		schedules:  map[string]projection.Schedule{},
 		projectSvc: projection.NewService(bus),
-		projection: nil,
+		projector:  projector,
 		running:    false,
 		onError:    defaultOnErrorFunc,
 	}
 	for _, v := range opts {
-		v(projector)
+		v(worker)
 	}
-	projector.schedules = projector.projection.WithSchedules(bus, store)
+	// projector.schedules = projector.projection.WithSchedules(bus, store)
 	projection.RegisterService(reg)
-	return projector
+	return worker
 }
 
 func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption) (<-chan error, error) {
 	// svc.projection.Register()
 	svc.running = true
-	errs := make(chan error)
-	for name, s := range svc.schedules {
+	var projErrsArr []<-chan error
+	for name, s := range svc.projector.Schedules() {
 		jobId := uuid.New()
 		logger := svc.logger.With("job_name", name, "job_id", jobId)
-		svc.projectSvc.Register(name, s)
+		svc.projectSvc.Register(name, s.Schedule)
 		ctx = context.WithValue(ctx, ContextKeyJobName, name)
 		ctx = context.WithValue(ctx, ContextKeyId, jobId)
-		perrs, err := s.Subscribe(
-			ctx,
-			svc.projection.HandleJob,
-			opts...,
-		)
+
+		errs, err := s.Subscribe(ctx, svc.projector.HandleJob)
 		if err != nil {
 			return nil, err
 		}
 
-		c, err := svc.projectSvc.Run(ctx)
-		if err != nil {
-			return nil, err
-		}
-		go func(errs chan error, triggerErrs <-chan error, projErrs <-chan error) {
-			for {
-				select {
-				case e := <-triggerErrs:
-					if err == nil {
-						continue
-					}
-					logger.Errorw("projection trigger err", "err", err)
-					errs <- fmt.Errorf("trigger error occurred: %w", e)
-				case e := <-projErrs:
-					if err == nil {
-						continue
-					}
-					logger.Errorw("projection err", "err", err)
-					errs <- fmt.Errorf("proj error occurred: %w", e)
-				}
-			}
-		}(errs, c, perrs)
+		errs = streams.Map(
+			ctx,
+			errs,
+			func(e error) error {
+				logger.Errorw("projection err", "err", err)
+				return fmt.Errorf("projection error occurred: %w", e)
+			},
+		)
+
+		projErrsArr = append(projErrsArr, errs)
 	}
-	return errs, nil
+
+	triggerErrs, err := svc.projectSvc.Run(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	projErrs := streams.FanInContext(ctx, projErrsArr...)
+
+	triggerErrs = streams.Map(
+		ctx,
+		triggerErrs,
+		func(e error) error {
+			svc.logger.Errorw("trigger err", "err", err)
+			return fmt.Errorf("projection trigger error occurred: %w", e)
+		},
+	)
+
+	return streams.FanInContext(ctx, triggerErrs, projErrs), nil
 }
