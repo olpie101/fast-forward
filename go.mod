@@ -6,7 +6,7 @@ require (
 	github.com/gojek/heimdall/v7 v7.0.2
 	github.com/google/uuid v1.3.1
 	github.com/invopop/jsonschema v0.7.0
-	github.com/modernice/goes v0.3.7
+	github.com/modernice/goes v0.3.6
 	github.com/nats-io/nats.go v1.28.0
 	github.com/pkg/errors v0.9.1
 	go.uber.org/zap v1.25.0
