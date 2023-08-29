@@ -293,6 +293,16 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 	for _, sub := range subjects {
 		go func(sub string, wg *sync.WaitGroup) {
 			defer wg.Done()
+			str, err := s.js.Stream(ctx, stream)
+
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			i := str.CachedInfo()
+			sub = normaliseSubject(i.Config.Subjects[0], sub)
+
 			c, err := s.js.CreateOrUpdateConsumer(
 				ctx,
 				stream,
@@ -308,7 +318,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 			)
 
 			if err != nil {
-				s.logger.Errorw("consumer error", "err", err)
+				s.logger.Errorw("consumer error", "err", err, "stream", stream, "subject", sub)
 				errs <- err
 				return
 			}
@@ -319,7 +329,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 			}
 
 			if err != nil {
-				s.logger.Errorw("consumer error", "err", err)
+				s.logger.Errorw("consumer error", "err", err, "stream", stream, "subject", sub)
 				errs <- err
 				return
 			}
@@ -335,19 +345,19 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 			for {
 				msg, err := it.Next()
 				if err != nil {
-					s.logger.Errorw("err getting next msg", "err", err)
+					s.logger.Errorw("err getting next msg", "err", err, "stream", stream, "subject", sub)
 					errs <- err
 					break
 				}
 				err = push(msg)
 				if err != nil {
-					s.logger.Errorw("err pushing next msg", "err", err)
+					s.logger.Errorw("err pushing next msg", "err", err, "stream", stream, "subject", sub)
 					errs <- err
 					break
 				}
 				err = msg.Ack()
 				if err != nil {
-					s.logger.Errorw("err acking msg", "err", err)
+					s.logger.Errorw("err acking msg", "err", err, "stream", stream, "subject", sub)
 					errs <- err
 					break
 				}
@@ -709,4 +719,13 @@ func max[T constraints.Ordered](s []T) T {
 
 func eventFromSubject(subject string) string {
 	return strings.Split(subject, ".")[4]
+}
+
+func normaliseSubject(streamSubject, subject string) string {
+	strParts := strings.Split(streamSubject, ".")
+	subParts := strings.Split(subject, ".")
+	if strParts[1] != subParts[1] {
+		subParts[1] = strParts[1]
+	}
+	return strings.Join(subParts, ".")
 }
