@@ -385,7 +385,6 @@ func (s *Store) streamFunc(subject string) ([]string, error) {
 	parts := strings.Split(subject, ".")
 	hasAggregate := parts[1] != "*"
 	hasEvent := parts[4] != "*"
-	s.logger.Debugw("streamFunc", "subject", subject, "hasAggregate", hasAggregate, "hasEvent", hasEvent, "aggMap", s.evtStreamMapper)
 	if hasAggregate {
 		return []string{s.aggStreamMapper[parts[1]]}, nil
 	}
