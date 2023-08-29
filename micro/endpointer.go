@@ -46,6 +46,7 @@ func (o *endpointOpts) Handler() micro.Handler {
 		fn = mw(fn)
 	}
 	return micro.ContextHandler(o.ctx, func(ctx context.Context, r micro.Request) {
+		ctx = o.ctxFn(ctx, r.Subject(), r.Headers())
 		ctx, cancel := handlerCtx(ctx, o.timeout)
 		defer cancel()
 
