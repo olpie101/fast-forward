@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -231,12 +230,6 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	s.logger.Debugw("subject list", "subs", subjects)
 
-	opErrs := make(chan error, 1)
-	defer close(opErrs)
-	subErrs := make(chan error, 1)
-
-	errs := streams.FanInContext(ctx, opErrs, subErrs)
-
 	groups := make(map[string][]string)
 	for _, subject := range subjects {
 		streams, err := s.streamFunc(subject)
@@ -254,21 +247,27 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	cmsgs := make(chan jetstream.Msg, 200)
 	push := streams.ConcurrentContext(subCtx, cmsgs)
+	subErrs := make(chan error, 1)
+
+	for stream, subjects := range groups {
+		go s.subscribe(subCtx, &wg, stream, subjects, push, subErrs, opts...)
+	}
+
 	go func() {
 		wg.Wait()
 		close(cmsgs)
 		close(subErrs)
 	}()
 
-	for stream, subjects := range groups {
-		go s.subscribe(subCtx, &wg, stream, subjects, push, subErrs, opts...)
-	}
+	opErrs := make(chan error, 1)
+	defer close(opErrs)
 
-	msgs, err := s.collect(ctx, cmsgs, subErrs, guard)
+	msgs, err := s.collect(ctx, cmsgs, opErrs, guard)
 	if err != nil {
 		opErrs <- err
 	}
 
+	errs := streams.FanInContext(ctx, opErrs, subErrs)
 	select {
 	case <-subCtx.Done():
 		return nil, errs, nil
@@ -311,14 +310,14 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 					AckPolicy:         jetstream.AckExplicitPolicy,
 					FilterSubject:     sub,
 					ReplayPolicy:      jetstream.ReplayInstantPolicy,
-					InactiveThreshold: 200 * time.Millisecond,
+					InactiveThreshold: 10 * time.Second,
 					MemoryStorage:     true,
 					// FilterSubjects:     subjects,
 				},
 			)
 
 			if err != nil {
-				s.logger.Errorw("consumer error", "err", err, "stream", stream, "subject", sub)
+				s.logger.Errorw("create consumer error", "err", err, "stream", stream, "subject", sub)
 				errs <- err
 				return
 			}
@@ -328,19 +327,14 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 				return
 			}
 
+			it, err := c.Messages(jetstream.PullExpiry(500 * time.Millisecond))
 			if err != nil {
-				s.logger.Errorw("consumer error", "err", err, "stream", stream, "subject", sub)
+				s.logger.Errorw("unable to get next message", "err", err, "stream", stream, "subject", sub)
 				errs <- err
 				return
 			}
+			defer it.Stop()
 
-			it, err := c.Messages()
-			defer func() {
-				go it.Stop()
-			}()
-			if err != nil {
-				log.Fatal(err)
-			}
 			var count uint64 = 0
 			for {
 				msg, err := it.Next()
