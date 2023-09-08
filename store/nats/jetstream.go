@@ -387,7 +387,6 @@ func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, errs cha
 			func(e event.Event) bool { return e != nil },
 			g.guard,
 		),
-		errs,
 	)
 }
 
