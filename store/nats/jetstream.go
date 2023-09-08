@@ -445,43 +445,53 @@ func natsOpts(ctx context.Context, q event.Query) []nats.SubOpt {
 		nats.ReplayInstant(),
 		nats.Context(ctx),
 	}
-
-	// TODO: this is incorrect. The sequences will not match
-	if q.AggregateVersions() != nil && len(q.AggregateVersions().Min()) > 0 {
-		min := min(q.AggregateVersions().Min())
-		opts = append(opts, nats.StartSequence(uint64(min)))
-	}
-
-	if q.Times() != nil && (q.Times().Min() != time.Time{}) {
-		opts = append(opts, nats.StartTime(q.Times().Min()))
-	}
 	return opts
 }
 
 type limitGuard struct {
-	versionGuard func(e event.Event) bool
-	maxTimeGuard func(e event.Event) bool
+	minVersionGuard func(e event.Event) bool
+	maxVersionGuard func(e event.Event) bool
+	minTimeGuard    func(e event.Event) bool
+	maxTimeGuard    func(e event.Event) bool
 }
 
 func (g limitGuard) guard(e event.Event) bool {
-	return g.maxTimeGuard(e) && g.versionGuard(e)
+	return g.minTimeGuard(e) && g.maxTimeGuard(e) && g.minVersionGuard(e) && g.maxVersionGuard(e)
 }
 
 func newLimitGuard(q event.Query) limitGuard {
 	guard := limitGuard{
-		versionGuard: func(e event.Event) bool { return true },
-		maxTimeGuard: func(e event.Event) bool { return true },
+		minVersionGuard: func(e event.Event) bool { return true },
+		maxVersionGuard: func(e event.Event) bool { return true },
+		minTimeGuard:    func(e event.Event) bool { return true },
+		maxTimeGuard:    func(e event.Event) bool { return true },
 	}
 
-	if q.AggregateVersions() != nil && len(q.AggregateVersions().Max()) > 0 {
-		guard.versionGuard = func(e event.Event) bool {
-			return pick.AggregateVersion(e) <= max(q.AggregateVersions().Max())
+	if q.AggregateVersions() != nil {
+		if len(q.AggregateVersions().Min()) > 0 {
+			fmt.Println("HELLO MIN")
+			guard.minVersionGuard = func(e event.Event) bool {
+				return pick.AggregateVersion(e) >= min(q.AggregateVersions().Max())
+			}
+		}
+		if len(q.AggregateVersions().Max()) > 0 {
+			fmt.Println("HELLO MAX")
+			guard.maxVersionGuard = func(e event.Event) bool {
+				return pick.AggregateVersion(e) <= max(q.AggregateVersions().Max())
+			}
 		}
 	}
 
-	if q.Times() != nil && (q.Times().Max() != time.Time{}) {
-		guard.maxTimeGuard = func(e event.Event) bool {
-			return e.Time().Before(q.Times().Max().Add(time.Microsecond))
+	if q.Times() != nil {
+		if !q.Times().Min().IsZero() {
+			guard.minTimeGuard = func(e event.Event) bool {
+				return e.Time().After(q.Times().Min())
+			}
+		}
+		if !q.Times().Max().IsZero() {
+			guard.maxTimeGuard = func(e event.Event) bool {
+				return e.Time().Before(q.Times().Max())
+			}
 		}
 	}
 
