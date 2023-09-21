@@ -462,13 +462,11 @@ func newLimitGuard(q event.Query) limitGuard {
 
 	if q.AggregateVersions() != nil {
 		if len(q.AggregateVersions().Min()) > 0 {
-			fmt.Println("HELLO MIN")
 			guard.minVersionGuard = func(e event.Event) bool {
-				return pick.AggregateVersion(e) >= min(q.AggregateVersions().Max())
+				return pick.AggregateVersion(e) >= min(q.AggregateVersions().Min())
 			}
 		}
 		if len(q.AggregateVersions().Max()) > 0 {
-			fmt.Println("HELLO MAX")
 			guard.maxVersionGuard = func(e event.Event) bool {
 				return pick.AggregateVersion(e) <= max(q.AggregateVersions().Max())
 			}
