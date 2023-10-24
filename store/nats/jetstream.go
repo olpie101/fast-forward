@@ -47,28 +47,20 @@ type Store struct {
 	js              jetstream.JetStream
 	enc             EncodingRegisterer
 	logger          *zap.SugaredLogger
-	encMap          map[string]string
 	aggStreamMapper map[string]string
 	evtStreamMapper map[string][]string
+	legacy          bool
 }
 
-func New(js jetstream.JetStream, enc EncodingRegisterer, logger *zap.SugaredLogger) *Store {
+func New(js jetstream.JetStream, enc EncodingRegisterer, logger *zap.SugaredLogger, legacy bool) *Store {
 	return &Store{
 		js:              js,
 		enc:             enc,
 		logger:          logger,
-		encMap:          generateEncodingMap(enc),
+		legacy:          legacy,
 		aggStreamMapper: map[string]string{},
 		evtStreamMapper: map[string][]string{},
 	}
-}
-
-func generateEncodingMap(enc EncodingRegisterer) map[string]string {
-	out := make(map[string]string, len(enc.Map()))
-	for k := range enc.Map() {
-		out[normaliseEventName(k)] = k
-	}
-	return out
 }
 
 // Insert inserts events into the store.
@@ -249,8 +241,13 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	push := streams.ConcurrentContext(subCtx, cmsgs)
 	subErrs := make(chan error, 1)
 
+	subFn := s.subscribe
+
+	if s.legacy {
+		subFn = s.subscribeLegacy
+	}
 	for stream, subjects := range groups {
-		go s.subscribe(subCtx, &wg, stream, subjects, push, subErrs, opts...)
+		go subFn(subCtx, &wg, stream, subjects, push, subErrs, opts...)
 	}
 
 	go func() {
@@ -262,6 +259,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
 
+	// TODO: this collect is sync
 	msgs, err := s.collect(ctx, cmsgs, opErrs, guard)
 	if err != nil {
 		opErrs <- err
@@ -282,39 +280,28 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	return streams.New(msgs), errs, nil
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
+func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
 	defer wg.Done()
 
 	var subWg sync.WaitGroup
 	subWg.Add(len(subjects))
 
-	// TODO: simplify this using `FilterSubjects` when nats 2.10 is out
+	str, err := s.js.Stream(ctx, stream)
+
+	if err != nil {
+		errs <- err
+		return
+	}
+
+	i := str.CachedInfo()
+
 	for _, sub := range subjects {
 		go func(sub string, wg *sync.WaitGroup) {
 			defer wg.Done()
-			str, err := s.js.Stream(ctx, stream)
 
-			if err != nil {
-				errs <- err
-				return
-			}
+			conCfg := consumerConfigLegacy(sub, i.Config)
 
-			i := str.CachedInfo()
-			sub = normaliseSubject(i.Config.Subjects[0], sub)
-
-			c, err := s.js.CreateOrUpdateConsumer(
-				ctx,
-				stream,
-				jetstream.ConsumerConfig{
-					DeliverPolicy:     jetstream.DeliverAllPolicy,
-					AckPolicy:         jetstream.AckExplicitPolicy,
-					FilterSubject:     sub,
-					ReplayPolicy:      jetstream.ReplayInstantPolicy,
-					InactiveThreshold: 10 * time.Second,
-					MemoryStorage:     true,
-					// FilterSubjects:     subjects,
-				},
-			)
+			c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
 
 			if err != nil {
 				s.logger.Errorw("create consumer error", "err", err, "stream", stream, "subject", sub)
@@ -322,47 +309,43 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 				return
 			}
 
-			expected := c.CachedInfo().NumPending
-			if expected == 0 {
-				return
-			}
-
-			it, err := c.Messages(jetstream.PullExpiry(500 * time.Millisecond))
+			err = consumeMessages(c, push)
 			if err != nil {
-				s.logger.Errorw("unable to get next message", "err", err, "stream", stream, "subject", sub)
+				s.logger.Errorw("err consuming messages", "err", err, "stream", stream, "subject", sub)
 				errs <- err
-				return
 			}
-			defer it.Stop()
 
-			var count uint64 = 0
-			for {
-				msg, err := it.Next()
-				if err != nil {
-					s.logger.Errorw("err getting next msg", "err", err, "stream", stream, "subject", sub)
-					errs <- err
-					break
-				}
-				err = push(msg)
-				if err != nil {
-					s.logger.Errorw("err pushing next msg", "err", err, "stream", stream, "subject", sub)
-					errs <- err
-					break
-				}
-				err = msg.Ack()
-				if err != nil {
-					s.logger.Errorw("err acking msg", "err", err, "stream", stream, "subject", sub)
-					errs <- err
-					break
-				}
-				count++
-				if count >= expected {
-					break
-				}
-			}
 		}(sub, &subWg)
 	}
 	subWg.Wait()
+}
+
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
+	defer wg.Done()
+
+	str, err := s.js.Stream(ctx, stream)
+
+	if err != nil {
+		errs <- err
+		return
+	}
+
+	i := str.CachedInfo()
+	conCfg := consumerConfig(subjects, i.Config)
+
+	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
+
+	if err != nil {
+		s.logger.Errorw("create consumer error", "err", err, "stream", stream, "subjects", conCfg.FilterSubjects)
+		errs <- err
+		return
+	}
+
+	err = consumeMessages(c, push)
+	if err != nil {
+		s.logger.Errorw("err consuming messages", "err", err, "stream", stream)
+		errs <- err
+	}
 }
 
 func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
@@ -397,6 +380,70 @@ func (s *Store) streamFunc(subject string) ([]string, error) {
 	}
 
 	return nil, fmt.Errorf("subject is not supported (%s)", subject)
+}
+
+func defaultConsumerConfig() jetstream.ConsumerConfig {
+	return jetstream.ConsumerConfig{
+		DeliverPolicy:     jetstream.DeliverAllPolicy,
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		ReplayPolicy:      jetstream.ReplayInstantPolicy,
+		InactiveThreshold: 10 * time.Second,
+		MemoryStorage:     true,
+	}
+}
+
+func consumerConfigLegacy(subject string, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
+	cfg := defaultConsumerConfig()
+	cfg.FilterSubject = normaliseSubject(sc.Subjects[0], subject)
+	return cfg
+}
+
+func consumerConfig(subjects []string, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
+	filterSubjects := make([]string, 0, len(subjects))
+	for _, s := range subjects {
+		filterSubjects = append(filterSubjects, normaliseSubject(sc.Subjects[0], s))
+	}
+
+	cfg := defaultConsumerConfig()
+	cfg.FilterSubjects = filterSubjects
+	return cfg
+}
+
+func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error) error {
+	expected := c.CachedInfo().NumPending
+	if expected == 0 {
+		return nil
+	}
+
+	it, err := c.Messages(jetstream.PullExpiry(500 * time.Millisecond))
+	if err != nil {
+		return err
+	}
+	defer it.Stop()
+
+	var count uint64 = 0
+	for {
+		msg, err := it.Next()
+		if err != nil {
+			return err
+		}
+
+		err = push(msg)
+		if err != nil {
+			return err
+		}
+
+		err = msg.Ack()
+		if err != nil {
+			return err
+		}
+
+		count++
+		if count >= expected {
+			break
+		}
+	}
+	return nil
 }
 
 func applySortings(evts []event.Event, sortings []event.SortOptions) {
