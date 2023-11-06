@@ -415,7 +415,7 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error) er
 		return nil
 	}
 
-	it, err := c.Messages(jetstream.PullExpiry(500 * time.Millisecond))
+	it, err := c.Messages(jetstream.PullExpiry(5 * time.Second))
 	if err != nil {
 		return err
 	}
