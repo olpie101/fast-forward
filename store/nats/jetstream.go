@@ -449,7 +449,7 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error) er
 func applySortings(evts []event.Event, sortings []event.SortOptions) {
 	slices.SortFunc(
 		evts,
-		func(a event.Of[any], b event.Of[any]) bool {
+		func(a event.Of[any], b event.Of[any]) int {
 			less := false
 			for _, sorter := range sortings {
 				switch sorter.Sort {
@@ -474,7 +474,11 @@ func applySortings(evts []event.Event, sortings []event.SortOptions) {
 					less = !less
 				}
 			}
-			return false
+			if less {
+				return -1
+			} else {
+				return 1
+			}
 		},
 	)
 }
