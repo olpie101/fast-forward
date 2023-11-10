@@ -162,10 +162,22 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 		return nil, nil, err
 	}
 
-	evts, errs, err := s.query(ctx, q, subjects)
-	if err != nil {
-		return nil, nil, err
+	var evts <-chan event.Event = nil
+	var errs <-chan error = nil
+
+	for i := 0; i < int(s.retryCount); i++ {
+		evts, errs, err = s.query(ctx, q, subjects)
+		if err != nil {
+			// retry if possible
+			if errors.Is(err, jetstream.ErrNoHeartbeat) && i < int(s.retryCount)-1 {
+				continue
+			} else {
+				return nil, nil, err
+			}
+		}
+		break
 	}
+
 	return evts, errs, nil
 }
 
@@ -284,6 +296,11 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		close(subErrs)
 	}()
 
+	err = <-subErrs
+	if err != nil {
+		return nil, nil, err
+	}
+
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
 
@@ -293,10 +310,9 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		opErrs <- err
 	}
 
-	errs := streams.FanInContext(ctx, opErrs, subErrs)
 	select {
 	case <-subCtx.Done():
-		return nil, errs, nil
+		return nil, opErrs, nil
 	default:
 		s.logger.Debugw("ctx not done")
 		break
@@ -305,7 +321,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	applySortings(msgs, q.Sortings())
 
 	s.logger.Debugw("total msg c", "total", len(msgs), "duration", time.Since(start))
-	return streams.New(msgs), errs, nil
+	return streams.New(msgs), opErrs, nil
 }
 
 func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
