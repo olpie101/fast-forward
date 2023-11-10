@@ -32,6 +32,10 @@ type eventMetadata struct {
 	aggregateVersion int
 }
 
+func (e eventMetadata) normalisedEventName() string {
+	return normaliseEventName(e.evtName)
+}
+
 func getMetadata(h nats.Header, sub string) (eventMetadata, error) {
 	evtId, evtName, evtTime, err := parseEventValues(h)
 	if err != nil {

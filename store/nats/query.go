@@ -183,10 +183,6 @@ func normaliseSubject(streamSubject, subject string) string {
 	return strings.Join(subParts, ".")
 }
 
-func eventFromSubject(subject string) string {
-	return strings.Split(subject, ".")[4]
-}
-
 func defaultConsumerConfig() jetstream.ConsumerConfig {
 	return jetstream.ConsumerConfig{
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
@@ -307,13 +303,12 @@ func (s *Store) processQueryMsg(msg jetstream.Msg) (event.Event, error) {
 		return nil, err
 	}
 
-	//TODO: get event from metadata and normalise to replace eventFromSubject
-	if streams, ok := s.evtStreamMapper[eventFromSubject(msg.Subject())]; !ok || (ok && len(streams) > 1) {
+	if streams, ok := s.evtStreamMapper[metadata.normalisedEventName()]; !ok || (ok && len(streams) > 1) {
 		md, err := msg.Metadata()
 		if err != nil {
 			return nil, err
 		}
-		s.evtStreamMapper[eventFromSubject(msg.Subject())] = []string{md.Stream}
+		s.evtStreamMapper[metadata.normalisedEventName()] = []string{md.Stream}
 	}
 
 	data, err := s.enc.Unmarshal(msg.Data(), metadata.evtName)
