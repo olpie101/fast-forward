@@ -20,7 +20,6 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
-	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
 )
 
@@ -526,13 +525,15 @@ func newLimitGuard(q event.Query) limitGuard {
 
 	if q.AggregateVersions() != nil {
 		if len(q.AggregateVersions().Min()) > 0 {
+			min := slices.Min(q.AggregateVersions().Min())
 			guard.minVersionGuard = func(e event.Event) bool {
-				return pick.AggregateVersion(e) >= min(q.AggregateVersions().Min())
+				return pick.AggregateVersion(e) >= min
 			}
 		}
 		if len(q.AggregateVersions().Max()) > 0 {
+			max := slices.Min(q.AggregateVersions().Max())
 			guard.maxVersionGuard = func(e event.Event) bool {
-				return pick.AggregateVersion(e) <= max(q.AggregateVersions().Max())
+				return pick.AggregateVersion(e) <= max
 			}
 		}
 	}
@@ -752,34 +753,6 @@ func unique[T comparable](s []T) []T {
 		}
 	}
 	return result
-}
-
-func min[T constraints.Ordered](s []T) T {
-	if len(s) == 0 {
-		var zero T
-		return zero
-	}
-	m := s[0]
-	for _, v := range s {
-		if m > v {
-			m = v
-		}
-	}
-	return m
-}
-
-func max[T constraints.Ordered](s []T) T {
-	if len(s) == 0 {
-		var zero T
-		return zero
-	}
-	m := s[0]
-	for _, v := range s {
-		if m < v {
-			m = v
-		}
-	}
-	return m
 }
 
 func eventFromSubject(subject string) string {
