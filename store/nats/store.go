@@ -87,11 +87,11 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 			return err
 		}
 		headers := make(nats.Header)
-		headers.Add("event-name", evt.Name())
-		headers.Add("event-time", evt.Time().Format(time.RFC3339Nano))
-		headers.Add("aggregate-name", pick.AggregateName(evt))
-		headers.Add("aggregate-id", pick.AggregateID(evt).String())
-		headers.Add("aggregate-version", fmt.Sprint(pick.AggregateVersion(evt)))
+		headers.Add(MetadataKeyEventName, evt.Name())
+		headers.Add(MetadataKeyEventTime, evt.Time().Format(time.RFC3339Nano))
+		headers.Add(MetadataKeyEventAggregateName, pick.AggregateName(evt))
+		headers.Add(MetadataKeyEventAggregateId, pick.AggregateID(evt).String())
+		headers.Add(MetadataKeyEventAggregateVersion, fmt.Sprint(pick.AggregateVersion(evt)))
 		sub, err := subjectFunc(name, u, version, evt.Name())
 		if err != nil {
 			return err

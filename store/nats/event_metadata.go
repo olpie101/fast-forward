@@ -8,6 +8,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// Event metadata keys
+const (
+	MetadataKeyEventName             = "event-name"
+	MetadataKeyEventTime             = "event-time"
+	MetadataKeyEventAggregateName    = "aggregate-name"
+	MetadataKeyEventAggregateId      = "aggregate-id"
+	MetadataKeyEventAggregateVersion = "aggregate-version"
 )
 
 type eventMetadata struct {
@@ -41,9 +51,9 @@ func getMetadata(h nats.Header, sub string) (eventMetadata, error) {
 }
 
 func parseEventValues(h nats.Header) (uuid.UUID, string, time.Time, error) {
-	evtName := h.Get("event-name")
-	evtTime := h.Get("event-time")
-	evtId := h.Get("Nats-Msg-Id")
+	evtName := h.Get(MetadataKeyEventName)
+	evtTime := h.Get(MetadataKeyEventTime)
+	evtId := h.Get(jetstream.MsgIDHeader)
 
 	id, err := uuid.Parse(evtId)
 	if err != nil {
