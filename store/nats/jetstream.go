@@ -1,3 +1,5 @@
+//go:generate go-options -new=false -output=jetstream_options.go -option=StoreOption -prefix=With -imports=go.uber.org/zap,time Store
+
 package nats
 
 import (
@@ -44,23 +46,51 @@ type StreamMapper struct {
 }
 
 type Store struct {
-	js              jetstream.JetStream
-	enc             EncodingRegisterer
+	js              jetstream.JetStream `options:"-"`
+	enc             EncodingRegisterer  `options:"-"`
 	logger          *zap.SugaredLogger
-	aggStreamMapper map[string]string
-	evtStreamMapper map[string][]string
-	legacy          bool
+	aggStreamMapper map[string]string   `options:"-"`
+	evtStreamMapper map[string][]string `options:"-"`
+	legacy          bool                `options:"-"`
+	retryCount      uint
+	pullExpiry      time.Duration
 }
 
-func New(js jetstream.JetStream, enc EncodingRegisterer, logger *zap.SugaredLogger, legacy bool) *Store {
-	return &Store{
+func defaultStoreOptions() []StoreOption {
+	return []StoreOption{
+		WithLogger(zap.NewNop().Sugar()),
+		WithRetryCount(3),
+		WithPullExpiry(time.Second),
+	}
+}
+
+func New(nc *nats.Conn, enc EncodingRegisterer, opts ...StoreOption) (*Store, error) {
+	options := defaultStoreOptions()
+	options = append(options, opts...)
+	legacy, err := isLegacy(nc.ConnectedServerVersion())
+	if err != nil {
+		return nil, errors.New("unable to determine server version")
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Store{
 		js:              js,
 		enc:             enc,
-		logger:          logger,
-		legacy:          legacy,
 		aggStreamMapper: map[string]string{},
 		evtStreamMapper: map[string][]string{},
+		legacy:          legacy,
 	}
+
+	err = applyStoreOptions(s, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	return s, nil
 }
 
 // Insert inserts events into the store.
@@ -126,8 +156,6 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 		"version min", q.AggregateVersions().Min(),
 		"version max", q.AggregateVersions().Max(),
 	)
-
-	// streams, err := s.identifyStreams(q.AggregateNames(), q.Names())
 
 	subjects, err := s.buildQuery(q)
 	if err != nil {
@@ -309,7 +337,7 @@ func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream 
 				return
 			}
 
-			err = consumeMessages(c, push)
+			err = consumeMessages(c, push, s.pullExpiry)
 			if err != nil {
 				s.logger.Errorw("err consuming messages", "err", err, "stream", stream, "subject", sub)
 				errs <- err
@@ -341,7 +369,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 		return
 	}
 
-	err = consumeMessages(c, push)
+	err = consumeMessages(c, push, s.pullExpiry)
 	if err != nil {
 		s.logger.Errorw("err consuming messages", "err", err, "stream", stream)
 		errs <- err
@@ -409,13 +437,13 @@ func consumerConfig(subjects []string, sc jetstream.StreamConfig) jetstream.Cons
 	return cfg
 }
 
-func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error) error {
+func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error, expTime time.Duration) error {
 	expected := c.CachedInfo().NumPending
 	if expected == 0 {
 		return nil
 	}
 
-	it, err := c.Messages(jetstream.PullExpiry(5 * time.Second))
+	it, err := c.Messages(jetstream.PullExpiry(expTime))
 	if err != nil {
 		return err
 	}
@@ -780,4 +808,23 @@ func normaliseSubject(streamSubject, subject string) string {
 		subParts[1] = strParts[1]
 	}
 	return strings.Join(subParts, ".")
+}
+
+func isLegacy(version string) (bool, error) {
+	parts := strings.Split(version, ".")
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false, err
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false, err
+	}
+
+	if major < 2 || (major == 2 && minor < 10) {
+		return true, nil
+	}
+
+	return false, nil
 }

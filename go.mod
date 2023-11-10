@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/gojek/heimdall/v7 v7.0.2
+	github.com/google/go-cmp v0.5.9
 	github.com/google/uuid v1.3.1
 	github.com/invopop/jsonschema v0.7.0
 	github.com/modernice/goes v0.4.4
