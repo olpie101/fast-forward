@@ -257,7 +257,6 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		return nil, nil, err
 	}
 
-	opts := natsOpts(ctx, q)
 	guard := newLimitGuard(q)
 
 	s.logger.Debugw("subject list", "subs", subjects)
@@ -287,7 +286,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		subFn = s.subscribeLegacy
 	}
 	for stream, subjects := range groups {
-		go subFn(subCtx, &wg, stream, subjects, push, subErrs, opts...)
+		go subFn(subCtx, &wg, stream, subjects, push, subErrs)
 	}
 
 	go func() {
@@ -324,7 +323,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	return streams.New(msgs), opErrs, nil
 }
 
-func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
+func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
 	var subWg sync.WaitGroup
@@ -364,7 +363,7 @@ func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream 
 	subWg.Wait()
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error, opts ...nats.SubOpt) {
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
 	str, err := s.js.Stream(ctx, stream)
@@ -525,15 +524,6 @@ func applySortings(evts []event.Event, sortings []event.SortOptions) {
 			}
 		},
 	)
-}
-
-func natsOpts(ctx context.Context, q event.Query) []nats.SubOpt {
-	opts := []nats.SubOpt{
-		nats.OrderedConsumer(),
-		nats.ReplayInstant(),
-		nats.Context(ctx),
-	}
-	return opts
 }
 
 type limitGuard struct {
