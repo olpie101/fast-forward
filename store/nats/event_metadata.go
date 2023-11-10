@@ -2,11 +2,14 @@ package nats
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modernice/goes/event"
+	"github.com/modernice/goes/helper/pick"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -84,4 +87,15 @@ func subjectToValues(sub string) (aggregateName string, id uuid.UUID, version in
 		return
 	}
 	return parts[0], id, version, nil
+}
+
+func genNatsHeader(evt event.Event) nats.Header {
+	header := make(nats.Header)
+	header.Set(MetadataKeyEventName, evt.Name())
+	header.Set(MetadataKeyEventTime, evt.Time().Format(time.RFC3339Nano))
+	header.Set(MetadataKeyEventAggregateName, pick.AggregateName(evt))
+	header.Set(MetadataKeyEventAggregateId, pick.AggregateID(evt).String())
+	header.Set(MetadataKeyEventAggregateVersion, fmt.Sprint(pick.AggregateVersion(evt)))
+	header.Set(jetstream.MsgIDHeader, evt.ID().String())
+	return header
 }

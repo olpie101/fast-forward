@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/modernice/goes/codec"
 	"github.com/modernice/goes/event"
-	"github.com/modernice/goes/helper/pick"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
@@ -77,45 +76,26 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 
 // Insert inserts events into the store.
 func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
+	msgs, err := s.genPublishMsgs(evts)
+	if err != nil {
+		return err
+	}
 	if len(evts) > 0 {
 		s.logger.Debugw("inserting events", "count", len(evts))
 	}
-	for _, evt := range evts {
-		u, name, version := evt.Aggregate()
-		b, err := s.enc.Marshal(evt.Data())
-		if err != nil {
-			return err
-		}
-		headers := make(nats.Header)
-		headers.Add(MetadataKeyEventName, evt.Name())
-		headers.Add(MetadataKeyEventTime, evt.Time().Format(time.RFC3339Nano))
-		headers.Add(MetadataKeyEventAggregateName, pick.AggregateName(evt))
-		headers.Add(MetadataKeyEventAggregateId, pick.AggregateID(evt).String())
-		headers.Add(MetadataKeyEventAggregateVersion, fmt.Sprint(pick.AggregateVersion(evt)))
-		sub, err := subjectFunc(name, u, version, evt.Name())
-		if err != nil {
-			return err
-		}
-
-		msg := &nats.Msg{
-			Subject: sub,
-			Header:  headers,
-			Data:    b,
-		}
-
+	for _, m := range msgs {
 		opts := []jetstream.PublishOpt{
-			jetstream.WithMsgID(evt.ID().String()),
 			jetstream.WithExpectLastSequencePerSubject(0),
 		}
 
 		_, err = s.js.PublishMsg(
 			ctx,
-			msg,
+			m,
 			opts...,
 		)
 
 		if err != nil {
-			s.logger.Errorw("err inserting events", "error", err, "subject", sub)
+			s.logger.Errorw("err inserting events", "error", err, "subject", m.Subject)
 			return err
 		}
 	}
@@ -199,4 +179,29 @@ func isLegacy(version string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func (s *Store) genPublishMsgs(evts []event.Event) ([]*nats.Msg, error) {
+	out := make([]*nats.Msg, 0, len(evts))
+	for _, evt := range evts {
+		u, name, version := evt.Aggregate()
+		b, err := s.enc.Marshal(evt.Data())
+		if err != nil {
+			return nil, err
+		}
+		header := genNatsHeader(evt)
+
+		sub, err := subjectFunc(name, u, version, evt.Name())
+		if err != nil {
+			return nil, err
+		}
+
+		msg := &nats.Msg{
+			Subject: sub,
+			Header:  header,
+			Data:    b,
+		}
+		out = append(out, msg)
+	}
+	return out, nil
 }
