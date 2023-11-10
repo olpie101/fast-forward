@@ -57,11 +57,6 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		close(subErrs)
 	}()
 
-	err = <-subErrs
-	if err != nil {
-		return nil, nil, err
-	}
-
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
 
@@ -71,11 +66,15 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		opErrs <- err
 	}
 
+	err = <-subErrs
+	if err != nil {
+		return nil, nil, err
+	}
+
 	select {
 	case <-subCtx.Done():
 		return nil, opErrs, nil
 	default:
-		s.logger.Debugw("ctx not done")
 		break
 	}
 
