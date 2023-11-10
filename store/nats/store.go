@@ -29,10 +29,13 @@ type Store struct {
 	logger          *zap.SugaredLogger
 	aggStreamMapper map[string]string   `options:"-"`
 	evtStreamMapper map[string][]string `options:"-"`
+	subFn           subFn               `options:"-"`
 	legacy          bool                `options:"-"`
 	retryCount      uint
 	pullExpiry      time.Duration
 }
+
+type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error)
 
 func defaultStoreOptions() []StoreOption {
 	return []StoreOption{
@@ -61,6 +64,12 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 		aggStreamMapper: map[string]string{},
 		evtStreamMapper: map[string][]string{},
 		legacy:          legacy,
+	}
+
+	s.subFn = s.subscribe
+
+	if legacy {
+		s.subFn = s.subscribeLegacy
 	}
 
 	err = applyStoreOptions(s, options...)
@@ -257,14 +266,8 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	push := streams.ConcurrentContext(subCtx, cmsgs)
 	subErrs := make(chan error, 1)
 
-	subFn := s.subscribe
-
-	// TODO: set this on New
-	if s.legacy {
-		subFn = s.subscribeLegacy
-	}
 	for stream, subjects := range groups {
-		go subFn(subCtx, &wg, stream, subjects, push, subErrs)
+		go s.subFn(subCtx, &wg, stream, subjects, push, subErrs)
 	}
 
 	go func() {
