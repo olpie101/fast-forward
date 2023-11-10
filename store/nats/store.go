@@ -1,4 +1,4 @@
-//go:generate go-options -new=false -output=jetstream_options.go -option=StoreOption -prefix=With -imports=go.uber.org/zap,time Store
+//go:generate go-options -new=false -output=store_options.go -option=StoreOption -prefix=With -imports=go.uber.org/zap,time Store
 
 package nats
 
