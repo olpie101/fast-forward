@@ -24,30 +24,9 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-type ContextKey string
-
-var (
-	ContextKeyAggregates = ContextKey("aggregates")
-)
-
-var (
-	ErrEndOfMsgs = errors.New("end of message stream")
-)
-
-type EncodingRegisterer interface {
-	codec.Encoding
-	Map() map[string]func() any
-}
-
-type StreamMapper struct {
-	AggregateName string
-	EventName     string
-	StreamName    string
-}
-
 type Store struct {
 	js              jetstream.JetStream `options:"-"`
-	enc             EncodingRegisterer  `options:"-"`
+	enc             codec.Encoding      `options:"-"`
 	logger          *zap.SugaredLogger
 	aggStreamMapper map[string]string   `options:"-"`
 	evtStreamMapper map[string][]string `options:"-"`
@@ -64,7 +43,7 @@ func defaultStoreOptions() []StoreOption {
 	}
 }
 
-func New(nc *nats.Conn, enc EncodingRegisterer, opts ...StoreOption) (*Store, error) {
+func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error) {
 	options := defaultStoreOptions()
 	options = append(options, opts...)
 	legacy, err := isLegacy(nc.ConnectedServerVersion())
@@ -95,7 +74,9 @@ func New(nc *nats.Conn, enc EncodingRegisterer, opts ...StoreOption) (*Store, er
 
 // Insert inserts events into the store.
 func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
-	s.logger.Debugw("inserting events")
+	if len(evts) > 0 {
+		s.logger.Debugw("inserting events", "count", len(evts))
+	}
 	for _, evt := range evts {
 		u, name, version := evt.Aggregate()
 		b, err := s.enc.Marshal(evt.Data())
@@ -135,7 +116,9 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 			return err
 		}
 	}
-	s.logger.Debug("inserted events")
+	if len(evts) > 0 {
+		s.logger.Debug("inserted events")
+	}
 	return nil
 }
 
@@ -179,11 +162,6 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 	}
 
 	return evts, errs, nil
-}
-
-func (s *Store) IdentifyStreams(ctx context.Context, aggregateNames, evtNames []string) error {
-	err := s.identifyStreams(ctx, aggregateNames, evtNames)
-	return err
 }
 
 func (s *Store) identifyStreams(ctx context.Context, aggregateNames, evtNames []string) error {
@@ -282,6 +260,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	subFn := s.subscribe
 
+	// TODO: set this on New
 	if s.legacy {
 		subFn = s.subscribeLegacy
 	}
