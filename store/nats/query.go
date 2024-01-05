@@ -19,7 +19,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	defer cancel()
 	start := time.Now()
 
-	err := s.identifyStreams(ctx, q.AggregateNames(), q.Names())
+	err := s.identifyStreams(ctx, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -41,6 +41,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	}
 
 	var wg sync.WaitGroup
+	fmt.Println("$$$$", groups)
 	wg.Add(len(groups))
 
 	cmsgs := make(chan jetstream.Msg, 200)
@@ -99,7 +100,15 @@ func (s *Store) streamFunc(subject string) ([]string, error) {
 	return nil, fmt.Errorf("subject is not supported (%s)", subject)
 }
 
-func (s *Store) identifyStreams(ctx context.Context, aggregateNames, evtNames []string) error {
+func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
+	aggregateNames := q.AggregateNames()
+	for _, r := range q.Aggregates() {
+		if !slices.Contains(aggregateNames, r.Name) {
+			aggregateNames = append(aggregateNames, r.Name)
+		}
+	}
+	evtNames := q.Names()
+
 	for _, a := range aggregateNames {
 		if _, ok := s.aggStreamMapper[a]; ok {
 			//already identified

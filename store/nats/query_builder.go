@@ -3,28 +3,34 @@ package nats
 import (
 	"fmt"
 
-	"github.com/google/uuid"
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/event/query/version"
 	"golang.org/x/exp/slices"
 )
 
 func (s *Store) buildQuery(q event.Query) ([]string, error) {
-	names := q.Names()
 	subjects := buildEventNameQuery(
 		buildAggregateVersionsQuery(
 			buildAggregateIdsQuery(
-				buildAggregatesQuery(q.AggregateNames()),
-				q.AggregateIDs(),
+				buildAggregatesQuery(q),
+				q,
 			),
 			q.AggregateVersions(),
 		),
-		names,
+		q.Names(),
 	)
 	return subjects, nil
 }
 
-func buildAggregatesQuery(names []string) []string {
+func buildAggregatesQuery(q event.Query) []string {
+	names := q.AggregateNames()
+
+	for _, r := range q.Aggregates() {
+		if !slices.Contains(names, r.Name) {
+			names = append(names, r.Name)
+		}
+	}
+
 	if len(names) == 0 {
 		return []string{"es.*"}
 	}
@@ -36,7 +42,8 @@ func buildAggregatesQuery(names []string) []string {
 	return out
 }
 
-func buildAggregateIdsQuery(aggQueries []string, ids []uuid.UUID) []string {
+func buildAggregateIdsQuery(aggQueries []string, q event.Query) []string {
+	ids := q.AggregateIDs()
 	if len(ids) == 0 {
 		for i := 0; i < len(aggQueries); i++ {
 			aggQueries[i] = fmt.Sprintf("%s.*", aggQueries[i])
