@@ -44,6 +44,13 @@ func buildAggregatesQuery(q event.Query) []string {
 
 func buildAggregateIdsQuery(aggQueries []string, q event.Query) []string {
 	ids := q.AggregateIDs()
+
+	for _, r := range q.Aggregates() {
+		if !slices.Contains(ids, r.ID) {
+			ids = append(ids, r.ID)
+		}
+	}
+
 	if len(ids) == 0 {
 		for i := 0; i < len(aggQueries); i++ {
 			aggQueries[i] = fmt.Sprintf("%s.*", aggQueries[i])
