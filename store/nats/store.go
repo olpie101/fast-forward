@@ -54,7 +54,7 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 	options = append(options, opts...)
 	legacy, err := isLegacy(nc.ConnectedServerVersion())
 	if err != nil {
-		return nil, errors.New("unable to determine server version")
+		return nil, errors.New("store: unable to determine server version")
 	}
 
 	js, err := jetstream.New(nc)

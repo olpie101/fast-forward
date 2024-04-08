@@ -180,15 +180,13 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
 
 	if err != nil {
-		s.logger.Errorw("create consumer error", "err", err, "stream", stream, "subjects", conCfg.FilterSubjects)
-		errs <- err
+		errs <- fmt.Errorf("create consumer error (stream: %s): %w", stream, err)
 		return
 	}
 
 	err = consumeMessages(c, push, s.pullExpiry)
 	if err != nil {
-		s.logger.Errorw("err consuming messages", "err", err, "stream", stream)
-		errs <- err
+		errs <- fmt.Errorf("err consuming messages (stream: %s): %w", stream, err)
 	}
 }
 
