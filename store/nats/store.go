@@ -1,4 +1,4 @@
-//go:generate go-options -new=false -output=store_options.go -option=StoreOption -prefix=With -imports=go.uber.org/zap,time Store
+//go:generate go-options -new=false -output=store_options.go -option=StoreOption -prefix=With -imports=github.com/olpie101/fast-forward/kv,go.uber.org/zap,time Store
 
 package nats
 
@@ -77,6 +77,11 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 	err = applyStoreOptions(s, options...)
 	if err != nil {
 		return nil, err
+	}
+
+	err = validateStore(s)
+	if err != nil {
+		return nil, fmt.Errorf("store init: %w", err)
 	}
 
 	return s, nil
@@ -273,6 +278,21 @@ func (s *Store) releaseLeases(ctx context.Context, keys []string) error {
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateStore(s *Store) error {
+	if s.js == nil {
+		return errors.New("jetstream cannot be nil")
+	}
+
+	if s.enc == nil {
+		return errors.New("encoding cannot be nil")
+	}
+
+	if s.writeLeaseKV == nil {
+		return errors.New("write lease kv cannot be nil")
 	}
 	return nil
 }
