@@ -207,6 +207,7 @@ func defaultConsumerConfig() jetstream.ConsumerConfig {
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		ReplayPolicy:      jetstream.ReplayInstantPolicy,
 		InactiveThreshold: 10 * time.Second,
+		Replicas:          1,
 		MemoryStorage:     true,
 	}
 }
