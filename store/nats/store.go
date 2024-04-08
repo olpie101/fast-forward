@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,7 +54,7 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 	options = append(options, opts...)
 	legacy, err := isLegacy(nc.ConnectedServerVersion())
 	if err != nil {
-		return nil, errors.New("unable to determine server version")
+		return nil, errors.New("store: unable to determine server version")
 	}
 
 	js, err := jetstream.New(nc)
@@ -160,8 +161,12 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 		if err != nil {
 			// retry if possible
 			if errors.Is(err, jetstream.ErrNoHeartbeat) && i < int(s.retryCount)-1 {
+				s.logger.Errorw("error consuming messages retrying...", "count", i+1)
+				backoff := time.Duration(2 * math.Pow(2, float64(i)))
+				<-time.After(backoff * time.Second)
 				continue
 			} else {
+				s.logger.Errorw("error executing query", "err", err)
 				return nil, nil, err
 			}
 		}

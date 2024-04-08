@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/modernice/goes/event"
-	"github.com/modernice/goes/helper/pick"
 	"github.com/modernice/goes/helper/streams"
 	"github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/exp/slices"
@@ -62,7 +61,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	defer close(opErrs)
 
 	// TODO: this collect is sync
-	msgs, err := s.collect(ctx, cmsgs, opErrs, guard)
+	evts, err := s.collect(ctx, cmsgs, opErrs, guard)
 	if err != nil {
 		opErrs <- err
 	}
@@ -79,10 +78,21 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		break
 	}
 
-	applySortings(msgs, q.Sortings())
+	sortings := q.Sortings()
+	if len(q.Sortings()) == 0 {
+		sortings = append(
+			sortings,
+			event.SortOptions{
+				Sort: event.SortTime,
+				Dir:  event.SortAsc,
+			},
+		)
+	}
 
-	s.logger.Debugw("total msg c", "total", len(msgs), "duration", time.Since(start))
-	return streams.New(msgs), opErrs, nil
+	evts = event.SortMulti(evts, sortings...)
+
+	s.logger.Debugw("total evts c", "total", len(evts), "duration", time.Since(start))
+	return streams.New(evts), opErrs, nil
 }
 
 func (s *Store) streamFunc(subject string) ([]string, error) {
@@ -170,15 +180,13 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
 
 	if err != nil {
-		s.logger.Errorw("create consumer error", "err", err, "stream", stream, "subjects", conCfg.FilterSubjects)
-		errs <- err
+		errs <- fmt.Errorf("create consumer error (stream: %s): %w", stream, err)
 		return
 	}
 
 	err = consumeMessages(c, push, s.pullExpiry)
 	if err != nil {
-		s.logger.Errorw("err consuming messages", "err", err, "stream", stream)
-		errs <- err
+		errs <- fmt.Errorf("err consuming messages (stream: %s): %w", stream, err)
 	}
 }
 
@@ -197,6 +205,7 @@ func defaultConsumerConfig() jetstream.ConsumerConfig {
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		ReplayPolicy:      jetstream.ReplayInstantPolicy,
 		InactiveThreshold: 10 * time.Second,
+		Replicas:          1,
 		MemoryStorage:     true,
 	}
 }
@@ -247,43 +256,6 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error, ex
 		}
 	}
 	return nil
-}
-
-func applySortings(evts []event.Event, sortings []event.SortOptions) {
-	slices.SortFunc(
-		evts,
-		func(a event.Of[any], b event.Of[any]) int {
-			less := false
-			for _, sorter := range sortings {
-				switch sorter.Sort {
-				case event.SortTime:
-					less = a.Time().Before(b.Time())
-				case event.SortAggregateVersion:
-					if pick.AggregateName(a) != pick.AggregateName(b) {
-						less = pick.AggregateName(a) < pick.AggregateName(b)
-						continue
-					}
-					if pick.AggregateID(a) != pick.AggregateID(b) {
-						less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
-						continue
-					}
-					less = pick.AggregateVersion(a) < pick.AggregateVersion(b)
-				case event.SortAggregateName:
-					less = pick.AggregateName(a) < pick.AggregateName(b)
-				case event.SortAggregateID:
-					less = pick.AggregateID(a).String() < pick.AggregateID(b).String()
-				}
-				if sorter.Dir == event.SortDesc {
-					less = !less
-				}
-			}
-			if less {
-				return -1
-			} else {
-				return 1
-			}
-		},
-	)
 }
 
 func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
