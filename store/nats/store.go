@@ -16,7 +16,14 @@ import (
 	"github.com/modernice/goes/event"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/olpie101/fast-forward/kv"
 	"go.uber.org/zap"
+	"golang.org/x/exp/maps"
+)
+
+// Error
+var (
+	ErrLeaseLocked = errors.New("lease is currently locked")
 )
 
 type Store struct {
@@ -28,6 +35,7 @@ type Store struct {
 	subFn           subFn               `options:"-"`
 	retryCount      uint
 	pullExpiry      time.Duration
+	writeLeaseKV    kv.KeyValuer[*kv.NilValue]
 }
 
 type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error)
@@ -76,6 +84,17 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 
 // Insert inserts events into the store.
 func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
+	leases, err := s.obtainLeases(ctx, evts)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rErr := s.releaseLeases(ctx, leases)
+		if rErr != nil {
+			s.logger.Errorw("unable to release leases")
+		}
+	}()
+
 	msgs, err := s.genPublishMsgs(evts)
 	if err != nil {
 		return err
@@ -204,4 +223,56 @@ func (s *Store) genPublishMsgs(evts []event.Event) ([]*nats.Msg, error) {
 		out = append(out, msg)
 	}
 	return out, nil
+}
+
+func (s *Store) obtainLeases(ctx context.Context, evts []event.Event) (obtained []string, err error) {
+	found := make(map[string]struct{})
+	for _, evt := range evts {
+		id, name, _ := evt.Aggregate()
+
+		key := fmt.Sprintf("%s.%s", name, id)
+		if _, ok := found[key]; ok {
+			continue
+		}
+		found[key] = struct{}{}
+	}
+
+	keys := maps.Keys(found)
+	obtained = make([]string, 0, len(keys))
+
+	//release any leases previously obtained
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		rErr := s.releaseLeases(ctx, obtained)
+		if rErr != nil {
+			s.logger.Errorw("unable to release leases after failed obtained")
+		}
+	}()
+
+	for _, k := range keys {
+		_, err := s.writeLeaseKV.Create(ctx, k, &kv.NilValue{})
+		if err != nil {
+			natsErr := &nats.APIError{}
+			if ok := errors.As(err, &natsErr); ok && natsErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequence {
+				return nil, ErrLeaseLocked
+			}
+			return nil, err
+		}
+		obtained = append(obtained, k)
+	}
+
+	return obtained, nil
+}
+
+func (s *Store) releaseLeases(ctx context.Context, keys []string) error {
+	for _, k := range keys {
+		err := s.writeLeaseKV.Delete(ctx, k)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

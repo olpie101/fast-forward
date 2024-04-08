@@ -5,6 +5,7 @@ package nats
 import "fmt"
 
 import (
+	"github.com/olpie101/fast-forward/kv"
 	"go.uber.org/zap"
 	"time"
 )
@@ -119,6 +120,37 @@ func (o withPullExpiryImpl) String() string {
 
 func WithPullExpiry(o time.Duration) StoreOption {
 	return withPullExpiryImpl{
+		o: o,
+	}
+}
+
+type withWriteLeaseKVImpl struct {
+	o kv.KeyValuer[*kv.NilValue]
+}
+
+func (o withWriteLeaseKVImpl) apply(c *Store) error {
+	c.writeLeaseKV = o.o
+	return nil
+}
+
+func (o withWriteLeaseKVImpl) Equal(v withWriteLeaseKVImpl) bool {
+	switch {
+	case !cmp.Equal(o.o, v.o):
+		return false
+	}
+	return true
+}
+
+func (o withWriteLeaseKVImpl) String() string {
+	name := "WithWriteLeaseKV"
+
+	// hack to avoid go vet error about passing a function to Sprintf
+	var value interface{} = o.o
+	return fmt.Sprintf("%s: %+v", name, value)
+}
+
+func WithWriteLeaseKV(o kv.KeyValuer[*kv.NilValue]) StoreOption {
+	return withWriteLeaseKVImpl{
 		o: o,
 	}
 }
