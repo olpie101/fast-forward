@@ -154,3 +154,34 @@ func WithWriteLeaseKV(o kv.KeyValuer[*kv.NilValue]) StoreOption {
 		o: o,
 	}
 }
+
+type withVersionKVImpl struct {
+	o kv.KeyValuer[*kv.UInt64Value]
+}
+
+func (o withVersionKVImpl) apply(c *Store) error {
+	c.versionKV = o.o
+	return nil
+}
+
+func (o withVersionKVImpl) Equal(v withVersionKVImpl) bool {
+	switch {
+	case !cmp.Equal(o.o, v.o):
+		return false
+	}
+	return true
+}
+
+func (o withVersionKVImpl) String() string {
+	name := "WithVersionKV"
+
+	// hack to avoid go vet error about passing a function to Sprintf
+	var value interface{} = o.o
+	return fmt.Sprintf("%s: %+v", name, value)
+}
+
+func WithVersionKV(o kv.KeyValuer[*kv.UInt64Value]) StoreOption {
+	return withVersionKVImpl{
+		o: o,
+	}
+}

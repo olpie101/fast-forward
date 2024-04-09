@@ -40,7 +40,6 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	}
 
 	var wg sync.WaitGroup
-	fmt.Println("$$$$", groups)
 	wg.Add(len(groups))
 
 	cmsgs := make(chan jetstream.Msg, 200)
