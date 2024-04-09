@@ -19,12 +19,12 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/olpie101/fast-forward/kv"
 	"go.uber.org/zap"
-	"golang.org/x/exp/maps"
 )
 
 // Error
 var (
-	ErrLeaseLocked = errors.New("lease is currently locked")
+	ErrLeaseLocked               = errors.New("lease is currently locked")
+	ErrValidationVersionMismatch = errors.New("validation version mismatch")
 )
 
 type Store struct {
@@ -37,6 +37,14 @@ type Store struct {
 	retryCount      uint
 	pullExpiry      time.Duration
 	writeLeaseKV    kv.KeyValuer[*kv.NilValue]
+	versionKV       kv.KeyValuer[*kv.UInt64Value]
+}
+
+type versionInfo struct {
+	current      uint64
+	next         uint64
+	rev          uint64
+	finalVersion uint64
 }
 
 type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error)
@@ -95,13 +103,13 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 		return err
 	}
 	defer func() {
-		rErr := s.releaseLeases(ctx, leases)
+		rErr := s.releaseLeases(ctx, leases, true)
 		if rErr != nil {
 			s.logger.Errorw("unable to release leases")
 		}
 	}()
 
-	msgs, err := s.genPublishMsgs(evts)
+	msgs, err := s.genPublishMsgs(evts, leases)
 	if err != nil {
 		return err
 	}
@@ -210,10 +218,20 @@ func isLegacy(version string) (bool, error) {
 	return false, nil
 }
 
-func (s *Store) genPublishMsgs(evts []event.Event) ([]*nats.Msg, error) {
+func (s *Store) genPublishMsgs(evts []event.Event, leases map[string]versionInfo) ([]*nats.Msg, error) {
 	out := make([]*nats.Msg, 0, len(evts))
+	processed := make(map[string]struct{}, len(leases))
 	for _, evt := range evts {
 		u, name, version := evt.Aggregate()
+
+		lKey := writeLeaseKey(name, u)
+		if _, ok := processed[lKey]; !ok {
+			if lease := leases[lKey]; lease.next-1 != lease.current {
+				return nil, ErrValidationVersionMismatch
+			}
+			processed[lKey] = struct{}{}
+		}
+
 		b, err := s.enc.Marshal(evt.Data())
 		if err != nil {
 			return nil, err
@@ -235,20 +253,28 @@ func (s *Store) genPublishMsgs(evts []event.Event) ([]*nats.Msg, error) {
 	return out, nil
 }
 
-func (s *Store) obtainLeases(ctx context.Context, evts []event.Event) (obtained []string, err error) {
-	found := make(map[string]struct{})
+func (s *Store) obtainLeases(ctx context.Context, evts []event.Event) (obtained map[string]versionInfo, err error) {
+	found := make(map[string]versionInfo)
 	for _, evt := range evts {
-		id, name, _ := evt.Aggregate()
+		id, name, ver := evt.Aggregate()
 
-		key := fmt.Sprintf("%s.%s", name, id)
-		if _, ok := found[key]; ok {
+		key := writeLeaseKey(name, id)
+		if vi, ok := found[key]; ok {
+			// Update final version
+			_, _, ver := evt.Aggregate()
+			vi.finalVersion = uint64(ver)
+			found[key] = vi
 			continue
 		}
-		found[key] = struct{}{}
+
+		found[key] = versionInfo{
+			next:         uint64(ver),
+			finalVersion: uint64(ver),
+		}
 	}
 
-	keys := maps.Keys(found)
-	obtained = make([]string, 0, len(keys))
+	// keys := maps.Keys(found)
+	obtained = make(map[string]versionInfo, len(found))
 
 	//release any leases previously obtained
 	defer func() {
@@ -256,13 +282,13 @@ func (s *Store) obtainLeases(ctx context.Context, evts []event.Event) (obtained 
 			return
 		}
 
-		rErr := s.releaseLeases(ctx, obtained)
+		rErr := s.releaseLeases(ctx, obtained, false)
 		if rErr != nil {
 			s.logger.Errorw("unable to release leases after failed obtained")
 		}
 	}()
 
-	for _, k := range keys {
+	for k, v := range found {
 		_, err := s.writeLeaseKV.Create(ctx, k, &kv.NilValue{})
 		if err != nil {
 			natsErr := &nats.APIError{}
@@ -271,20 +297,50 @@ func (s *Store) obtainLeases(ctx context.Context, evts []event.Event) (obtained 
 			}
 			return nil, err
 		}
-		obtained = append(obtained, k)
+		ver, rev, err := s.getOrCreateCurrentVersion(ctx, k)
+		if err != nil {
+			return nil, err
+		}
+		v.current = ver
+		if ver == 0 {
+			v.current = v.next - 1
+		}
+		v.rev = rev
+		obtained[k] = v
 	}
 
 	return obtained, nil
 }
 
-func (s *Store) releaseLeases(ctx context.Context, keys []string) error {
-	for _, k := range keys {
+func (s *Store) releaseLeases(ctx context.Context, leases map[string]versionInfo, updateVersion bool) error {
+	for k, v := range leases {
+		if updateVersion {
+			_, err := s.versionKV.Update(ctx, k, &kv.UInt64Value{Value: v.finalVersion}, v.rev)
+			if err != nil {
+				return fmt.Errorf("unable to update aggregate version: %w", err)
+			}
+		}
 		err := s.writeLeaseKV.Delete(ctx, k)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Store) getOrCreateCurrentVersion(ctx context.Context, key string) (uint64, uint64, error) {
+	v, rev, err := s.versionKV.Get(ctx, key)
+	notFound := errors.Is(err, nats.ErrKeyNotFound)
+	if err != nil && !notFound {
+		return 0, 0, err
+	}
+	if notFound {
+		rev, err = s.versionKV.Create(ctx, key, &kv.UInt64Value{Value: 0})
+		if err != nil && !notFound {
+			return 0, 0, err
+		}
+	}
+	return v.Value, rev, nil
 }
 
 func validateStore(s *Store) error {
@@ -299,5 +355,13 @@ func validateStore(s *Store) error {
 	if s.writeLeaseKV == nil {
 		return errors.New("write lease kv cannot be nil")
 	}
+
+	if s.versionKV == nil {
+		return errors.New("aggregate version kv cannot be nil")
+	}
 	return nil
+}
+
+func writeLeaseKey(aggregateName string, id uuid.UUID) string {
+	return fmt.Sprintf("%s.%s", aggregateName, id)
 }
