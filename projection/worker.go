@@ -47,13 +47,11 @@ func New(projector Projector, bus event.Bus, reg *codec.Registry, opts ...Worker
 	for _, v := range opts {
 		v(worker)
 	}
-	// projector.schedules = projector.projection.WithSchedules(bus, store)
 	projection.RegisterService(reg)
 	return worker
 }
 
 func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption) (<-chan error, error) {
-	// svc.projection.Register()
 	svc.running = true
 	var projErrsArr []<-chan error
 	for name, s := range svc.projector.Schedules() {
@@ -63,17 +61,18 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 		ctx = context.WithValue(ctx, ContextKeyJobName, name)
 		ctx = context.WithValue(ctx, ContextKeyId, jobId)
 
+		svc.logger.Infow("starting worker", "name", name)
 		errs, err := s.Subscribe(ctx, svc.projector.HandleJob)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error subscribing to projection worker (%s): %w", name, err)
 		}
 
 		errs = streams.Map(
 			ctx,
 			errs,
 			func(e error) error {
-				logger.Errorw("projection err", "err", err)
-				return fmt.Errorf("projection error occurred: %w", e)
+				logger.Errorw("projection err", "worker_name", name, "err", err)
+				return fmt.Errorf("projection error occurred (%s): %w", name, e)
 			},
 		)
 
