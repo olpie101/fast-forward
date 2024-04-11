@@ -8,10 +8,17 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/modernice/goes/helper/streams"
 	"github.com/nats-io/nats.go"
 )
 
-type KeyValuer[T any] interface {
+type contextKey string
+
+var (
+	contextKeyStopOnZero = contextKey("stop-on-zero")
+)
+
+type KeyValuer[T MarshalerUnmarshaler] interface {
 	Keys(ctx context.Context) ([]string, error)
 	Get(ctx context.Context, key string) (T, uint64, error)
 	GetAll(ctx context.Context, keys []string) ([]T, error)
@@ -21,6 +28,13 @@ type KeyValuer[T any] interface {
 	// Status(ctx context.Context, key string) (nats.KeyValueStatus, error)
 	LastRevision(context.Context, string) (uint64, error)
 	Delete(ctx context.Context, key string, opts ...nats.DeleteOpt) error
+	WatchAll(ctx context.Context, opts ...nats.WatchOpt) (<-chan WatchValue[T], <-chan error, error)
+	Watch(ctx context.Context, sub string, opts ...nats.WatchOpt) (<-chan WatchValue[T], <-chan error, error)
+}
+
+type WatchValue[T MarshalerUnmarshaler] struct {
+	Value T
+	Key   string
 }
 
 type KeyValue[T MarshalerUnmarshaler] struct {
@@ -170,6 +184,77 @@ func (s *KeyValue[T]) Delete(ctx context.Context, key string, opts ...nats.Delet
 	return s.kv.Delete(key, opts...)
 }
 
+func (s *KeyValue[T]) WatchAll(ctx context.Context, opts ...nats.WatchOpt) (<-chan WatchValue[T], <-chan error, error) {
+	o := []nats.WatchOpt{
+		nats.Context(ctx),
+	}
+
+	o = append(o, opts...)
+
+	w, err := s.kv.WatchAll(o...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vals, errs := s.watch(ctx, w)
+	return vals, errs, nil
+}
+
+func (s *KeyValue[T]) Watch(ctx context.Context, sub string, opts ...nats.WatchOpt) (<-chan WatchValue[T], <-chan error, error) {
+	o := []nats.WatchOpt{
+		nats.Context(ctx),
+	}
+
+	o = append(o, opts...)
+
+	w, err := s.kv.Watch(sub, o...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vals, errs := s.watch(ctx, w)
+	return vals, errs, nil
+}
+
+func (s *KeyValue[T]) watch(ctx context.Context, kw nats.KeyWatcher) (<-chan WatchValue[T], <-chan error) {
+	out := make(chan WatchValue[T])
+	errs := make(chan error)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				err := kw.Stop()
+				if err != nil {
+					errs <- err
+				}
+				return
+			case kve := <-kw.Updates():
+				var v T
+				v = resolve(v).(T)
+
+				if kve == nil {
+					out <- WatchValue[T]{
+						Value: v,
+					}
+					continue
+				}
+
+				err := v.UnmarshalValue(kve.Value())
+				if err != nil {
+					errs <- err
+					continue
+				}
+
+				out <- WatchValue[T]{
+					Value: v,
+					Key:   kve.Key(),
+				}
+			}
+		}
+	}()
+	return out, errs
+}
+
 // A Marshaler can encode itself into bytes. aggregates must implement Marshaler
 // & Unmarshaler for Snapshots to work.
 //
@@ -258,4 +343,56 @@ func resolve(p any) any {
 		rv = reflect.New(rt).Elem()
 	}
 	return rv.Interface()
+}
+
+func WithStopOnZero(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyStopOnZero, true)
+}
+
+func isStopOnZero(ctx context.Context) bool {
+	return ctx.Value(contextKeyStopOnZero) != nil
+}
+
+func UnwrapValues[T MarshalerUnmarshaler](ctx context.Context, in <-chan WatchValue[T], errs <-chan error) (<-chan T, <-chan error, error) {
+	valChan, valPush, valClose := streams.NewConcurrentContext[T](ctx)
+	errConChan, errPush, errClose := streams.NewConcurrentContext[error](ctx)
+	errOut := make(chan error)
+	errChan, stop := streams.FanIn(errConChan, errOut)
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		defer func() {
+			cancel()
+			stop()
+			valClose()
+			errClose()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v := <-in:
+				var err error
+				if v.Key == "" {
+					if isStopOnZero(ctx) {
+						return
+					}
+					v.Value = resolve(v.Value).(T)
+				}
+				err = valPush(v.Value)
+				if err != nil {
+					errOut <- err
+				}
+			case e := <-errs:
+				err := errPush(e)
+				if err != nil {
+					errOut <- err
+				}
+			}
+
+		}
+	}()
+
+	return valChan, errChan, nil
 }
