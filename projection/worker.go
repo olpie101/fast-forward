@@ -20,6 +20,10 @@ var (
 	ContextKeyRunId   = ContextKey("run-id")
 )
 
+type Starter interface {
+	Start(context.Context) error
+}
+
 type Worker struct {
 	logger     *zap.SugaredLogger
 	projectSvc *projection.Service
@@ -91,6 +95,14 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 			return fmt.Errorf("projection trigger error occurred: %w", e)
 		},
 	)
+
+	starter, isStarter := svc.projector.(Starter)
+	if isStarter {
+		err := starter.Start(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return streams.FanInContext(ctx, triggerErrs, projErrs), nil
 }
