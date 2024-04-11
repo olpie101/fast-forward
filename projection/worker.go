@@ -20,6 +20,10 @@ var (
 	ContextKeyRunId   = ContextKey("run-id")
 )
 
+type Starter interface {
+	Start(context.Context) error
+}
+
 type Worker struct {
 	logger     *zap.SugaredLogger
 	projectSvc *projection.Service
@@ -43,13 +47,11 @@ func New(projector Projector, bus event.Bus, reg *codec.Registry, opts ...Worker
 	for _, v := range opts {
 		v(worker)
 	}
-	// projector.schedules = projector.projection.WithSchedules(bus, store)
 	projection.RegisterService(reg)
 	return worker
 }
 
 func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption) (<-chan error, error) {
-	// svc.projection.Register()
 	svc.running = true
 	var projErrsArr []<-chan error
 	for name, s := range svc.projector.Schedules() {
@@ -59,17 +61,18 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 		ctx = context.WithValue(ctx, ContextKeyJobName, name)
 		ctx = context.WithValue(ctx, ContextKeyId, jobId)
 
+		svc.logger.Infow("starting worker", "name", name)
 		errs, err := s.Subscribe(ctx, svc.projector.HandleJob)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error subscribing to projection worker (%s): %w", name, err)
 		}
 
 		errs = streams.Map(
 			ctx,
 			errs,
 			func(e error) error {
-				logger.Errorw("projection err", "err", err)
-				return fmt.Errorf("projection error occurred: %w", e)
+				logger.Errorw("projection err", "worker_name", name, "err", err)
+				return fmt.Errorf("projection error occurred (%s): %w", name, e)
 			},
 		)
 
@@ -91,6 +94,14 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 			return fmt.Errorf("projection trigger error occurred: %w", e)
 		},
 	)
+
+	starter, isStarter := svc.projector.(Starter)
+	if isStarter {
+		err := starter.Start(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return streams.FanInContext(ctx, triggerErrs, projErrs), nil
 }
