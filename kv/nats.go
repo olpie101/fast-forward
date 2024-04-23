@@ -89,67 +89,46 @@ func (s *KeyValue[T]) GetAll(ctx context.Context, keys []string) ([]T, error) {
 	var wg sync.WaitGroup
 	wg.Add(len(keys))
 	res := make(chan T, len(keys))
+	errs := make(chan error, 1)
+	go func() {
+		wg.Wait()
+		close(res)
+	}()
+
 	for _, id := range keys {
 		go func(wg *sync.WaitGroup, id string, res chan<- T) {
 			defer wg.Done()
-			kve, err := s.kv.Get(id)
+			kve, _, err := s.Get(ctx, id)
 			if err != nil {
-				fmt.Println(">>>>>>>failed to get")
-				// TODO: @olpie101 handle this error
-				// wg.Done()
+				errs <- fmt.Errorf("error getting key (%s): %w", id, err)
 				return
 			}
-			var v T
-			v = resolve(v).(T)
-			// resolve(f)
-			// if m := g.(T); ok {
-			// v = m
-			err = v.UnmarshalValue(kve.Value())
-			if err != nil {
-				fmt.Println(">>>>>>>failed to get", err)
-				// TODO: @olpie101 handle this error
-				// wg.Done()
-				return
-			}
-			// if r.debug {
-			// 	log.Printf("[goes/codec.Registry@Unmarshal] unmarshaling type %T (%s) using custom Unmarshaler", resolve(ptr), name)
-			// }
-
-			// if err := m.Unmarshal(b); err != nil {
-			// 	return nil, err
-			// }
-
-			// return resolve(ptr), nil
-			res <- v
-			// }
-
-			// err = v.UnmarshalValue(kve.Value())
-			// if err != nil {
-			// 	fmt.Println(">>>>>>>failed to get", err)
-			// 	// TODO: @olpie101 handle this error
-			// 	// wg.Done()
-			// 	return
-			// }
+			res <- kve
 		}(&wg, id, res)
 	}
-	sig := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(sig)
-	}()
+
 	out := make([]T, 0, len(keys))
+	var outErr error
 L:
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case a := <-res:
-			out = append(out, a)
-		case <-sig:
+		case err, ok := <-errs:
+			if !ok {
+				continue
+			}
+			outErr = err
 			break L
+		case a, ok := <-res:
+			if !ok {
+				break L
+			}
+			out = append(out, a)
 		}
 	}
-	return out, nil
+
+	return out, outErr
 }
 func (s *KeyValue[T]) Create(ctx context.Context, key string, value T) (revision uint64, err error) {
 	b, err := value.MarshalValue()
