@@ -90,6 +90,11 @@ func (s *KeyValue[T]) GetAll(ctx context.Context, keys []string) ([]T, error) {
 	wg.Add(len(keys))
 	res := make(chan T, len(keys))
 	errs := make(chan error, 1)
+	go func() {
+		wg.Wait()
+		close(res)
+	}()
+
 	for _, id := range keys {
 		go func(wg *sync.WaitGroup, id string, res chan<- T) {
 			defer wg.Done()
@@ -102,25 +107,28 @@ func (s *KeyValue[T]) GetAll(ctx context.Context, keys []string) ([]T, error) {
 		}(&wg, id, res)
 	}
 
-	go func() {
-		wg.Wait()
-		close(res)
-	}()
-
 	out := make([]T, 0, len(keys))
+	var outErr error
+L:
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case err := <-errs:
-			return nil, err
+		case err, ok := <-errs:
+			if !ok {
+				continue
+			}
+			outErr = err
+			break L
 		case a, ok := <-res:
 			if !ok {
-				return out, nil
+				break L
 			}
 			out = append(out, a)
 		}
 	}
+
+	return out, outErr
 }
 func (s *KeyValue[T]) Create(ctx context.Context, key string, value T) (revision uint64, err error) {
 	b, err := value.MarshalValue()
