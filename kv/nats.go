@@ -15,7 +15,8 @@ import (
 type contextKey string
 
 var (
-	contextKeyStopOnZero = contextKey("stop-on-zero")
+	contextKeyStopOnZero      = contextKey("stop-on-zero")
+	contextKeyNoErrOnNotFound = contextKey("no-err-on-not-found")
 )
 
 type KeyValuer[T MarshalerUnmarshaler] interface {
@@ -46,20 +47,6 @@ func New[T MarshalerUnmarshaler](kv nats.KeyValue) KeyValuer[T] {
 		kv: kv,
 	}
 }
-
-// func (s *KeyValue[T]) Get(ctx context.Context, key string) (T, error) {
-// 	kve, err := s.kv.Get(key)
-// 	var v T
-// 	if err != nil {
-// 		return v, err
-// 	}
-
-// 	err = v.UnmarshalValue(kve.Value())
-// 	if err != nil {
-// 		return v, err
-// 	}
-// 	return v, nil
-// }
 
 func (s *KeyValue[T]) Keys(ctx context.Context) ([]string, error) {
 	keys, err := s.kv.Keys()
@@ -94,12 +81,16 @@ func (s *KeyValue[T]) GetAll(ctx context.Context, keys []string) ([]T, error) {
 		wg.Wait()
 		close(res)
 	}()
+	noErrOnNotFound := isNoErrorOnNotFound(ctx)
 
 	for _, id := range keys {
 		go func(wg *sync.WaitGroup, id string, res chan<- T) {
 			defer wg.Done()
 			kve, _, err := s.Get(ctx, id)
 			if err != nil {
+				if errors.Is(err, nats.ErrKeyNotFound) && noErrOnNotFound {
+					return
+				}
 				errs <- fmt.Errorf("error getting key (%s): %w", id, err)
 				return
 			}
@@ -330,6 +321,14 @@ func WithStopOnZero(ctx context.Context) context.Context {
 
 func isStopOnZero(ctx context.Context) bool {
 	return ctx.Value(contextKeyStopOnZero) != nil
+}
+
+func WithNoErrorOnNotFound(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyNoErrOnNotFound, true)
+}
+
+func isNoErrorOnNotFound(ctx context.Context) bool {
+	return ctx.Value(contextKeyNoErrOnNotFound) != nil
 }
 
 func UnwrapValues[T MarshalerUnmarshaler](ctx context.Context, in <-chan WatchValue[T], errs <-chan error) (<-chan T, <-chan error, error) {
