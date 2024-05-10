@@ -217,7 +217,6 @@ func (s *KeyValue[T]) watch(ctx context.Context, kw nats.KeyWatcher) (<-chan Wat
 				err := v.UnmarshalValue(kve.Value())
 				if err != nil {
 					errs <- err
-					fmt.Println("kv err", kve.Key(), kve.Operation())
 					continue
 				}
 
