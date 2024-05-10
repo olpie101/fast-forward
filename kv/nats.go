@@ -205,6 +205,13 @@ func (s *KeyValue[T]) watch(ctx context.Context, kw nats.KeyWatcher) (<-chan Wat
 				var v T
 				v = resolve(v).(T)
 
+				if kve == nil {
+					out <- WatchValue[T]{
+						Value: v,
+					}
+					continue
+				}
+
 				// A delete/purge operation happened
 				if kve.Operation() != nats.KeyValuePut {
 					out <- WatchValue[T]{
