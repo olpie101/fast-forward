@@ -17,6 +17,7 @@ type contextKey string
 var (
 	contextKeyStopOnZero      = contextKey("stop-on-zero")
 	contextKeyNoErrOnNotFound = contextKey("no-err-on-not-found")
+	contextKeyDeletePurge     = contextKey("purge")
 )
 
 type Op = nats.KeyValueOp
@@ -154,7 +155,12 @@ func (s *KeyValue[T]) LastRevision(ctx context.Context, key string) (uint64, err
 	return uint64(kve.Revision()), nil
 }
 func (s *KeyValue[T]) Delete(ctx context.Context, key string, opts ...nats.DeleteOpt) error {
-	return s.kv.Delete(key, opts...)
+	purge := isDeletePurge(ctx)
+	if purge {
+		return s.kv.Purge(key, opts...)
+	} else {
+		return s.kv.Delete(key, opts...)
+	}
 }
 
 func (s *KeyValue[T]) WatchAll(ctx context.Context, opts ...nats.WatchOpt) (<-chan WatchValue[T], <-chan error, error) {
@@ -342,6 +348,14 @@ func WithNoErrorOnNotFound(ctx context.Context) context.Context {
 
 func isNoErrorOnNotFound(ctx context.Context) bool {
 	return ctx.Value(contextKeyNoErrOnNotFound) != nil
+}
+
+func WithPurge(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyDeletePurge, true)
+}
+
+func isDeletePurge(ctx context.Context) bool {
+	return ctx.Value(contextKeyDeletePurge) != nil
 }
 
 func UnwrapValues[T MarshalerUnmarshaler](ctx context.Context, in <-chan WatchValue[T], errs <-chan error) (<-chan T, <-chan error, error) {
