@@ -19,6 +19,8 @@ var (
 	contextKeyNoErrOnNotFound = contextKey("no-err-on-not-found")
 )
 
+type Op = nats.KeyValueOp
+
 type KeyValuer[T MarshalerUnmarshaler] interface {
 	Keys(ctx context.Context) ([]string, error)
 	Get(ctx context.Context, key string) (T, uint64, error)
@@ -34,6 +36,7 @@ type KeyValuer[T MarshalerUnmarshaler] interface {
 }
 
 type WatchValue[T MarshalerUnmarshaler] struct {
+	Op    Op
 	Value T
 	Key   string
 }
@@ -202,9 +205,11 @@ func (s *KeyValue[T]) watch(ctx context.Context, kw nats.KeyWatcher) (<-chan Wat
 				var v T
 				v = resolve(v).(T)
 
-				if kve == nil {
+				// A delete/purge operation happened
+				if kve.Operation() != nats.KeyValuePut {
 					out <- WatchValue[T]{
-						Value: v,
+						Op:  kve.Operation(),
+						Key: kve.Key(),
 					}
 					continue
 				}
@@ -212,10 +217,12 @@ func (s *KeyValue[T]) watch(ctx context.Context, kw nats.KeyWatcher) (<-chan Wat
 				err := v.UnmarshalValue(kve.Value())
 				if err != nil {
 					errs <- err
+					fmt.Println("kv err", kve.Key(), kve.Operation())
 					continue
 				}
 
 				out <- WatchValue[T]{
+					Op:    kve.Operation(),
 					Value: v,
 					Key:   kve.Key(),
 				}
