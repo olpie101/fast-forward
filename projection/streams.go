@@ -31,9 +31,27 @@ func Filter[T ProgressAwareTarget](t T, evts []event.Event) ([]event.Event, erro
 	)
 }
 
-type Group[K any, V any] struct {
+type Group[K comparable, V any] struct {
 	Key   K
 	Value []V
+}
+
+type Groups[K comparable, V any] []Group[K, V]
+
+func (g Groups[K, V]) Keys() []K {
+	out := make([]K, 0, len(g))
+	for _, v := range g {
+		out = append(out, v.Key)
+	}
+	return out
+}
+
+func (g Groups[K, V]) Map() map[K]Group[K, V] {
+	out := make(map[K]Group[K, V], len(g))
+	for _, v := range g {
+		out[v.Key] = v
+	}
+	return out
 }
 
 func GroupByFunc[K comparable, V any](ctx context.Context, groupFn func(V) (K, error), in <-chan V, errs ...<-chan error) ([]Group[K, V], error) {
