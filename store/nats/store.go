@@ -47,7 +47,7 @@ type versionInfo struct {
 	finalVersion uint64
 }
 
-type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error)
+type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error)
 
 func defaultStoreOptions() []StoreOption {
 	return []StoreOption{

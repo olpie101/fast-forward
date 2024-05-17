@@ -47,7 +47,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	subErrs := make(chan error, 1)
 
 	for stream, subjects := range groups {
-		go s.subFn(subCtx, &wg, stream, subjects, push, subErrs)
+		go s.subFn(subCtx, &wg, stream, subjects, q.Times().Min(), push, subErrs)
 	}
 
 	go func() {
@@ -163,7 +163,7 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 	return nil
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error) {
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
 	str, err := s.js.Stream(ctx, stream)
@@ -174,7 +174,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 	}
 
 	i := str.CachedInfo()
-	conCfg := consumerConfig(subjects, i.Config)
+	conCfg := consumerConfig(subjects, startTime, i.Config)
 
 	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
 
@@ -209,7 +209,7 @@ func defaultConsumerConfig() jetstream.ConsumerConfig {
 	}
 }
 
-func consumerConfig(subjects []string, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
+func consumerConfig(subjects []string, startTime time.Time, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
 	filterSubjects := make([]string, 0, len(subjects))
 	for _, s := range subjects {
 		filterSubjects = append(filterSubjects, normaliseSubject(sc.Subjects[0], s))
@@ -217,6 +217,11 @@ func consumerConfig(subjects []string, sc jetstream.StreamConfig) jetstream.Cons
 
 	cfg := defaultConsumerConfig()
 	cfg.FilterSubjects = filterSubjects
+
+	if !startTime.IsZero() {
+		cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
+		cfg.OptStartTime = &startTime
+	}
 	return cfg
 }
 

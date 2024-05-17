@@ -6,17 +6,23 @@ package nats
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-func consumerConfigLegacy(subject string, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
+func consumerConfigLegacy(subject string, startTime time.Time, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
 	cfg := defaultConsumerConfig()
 	cfg.FilterSubject = normaliseSubject(sc.Subjects[0], subject)
+
+	if !startTime.IsZero() {
+		cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
+		cfg.OptStartTime = &startTime
+	}
 	return cfg
 }
 
-func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, push func(...jetstream.Msg) error, errs chan<- error) {
+func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
 	var subWg sync.WaitGroup
@@ -35,7 +41,7 @@ func (s *Store) subscribeLegacy(ctx context.Context, wg *sync.WaitGroup, stream 
 		go func(sub string, wg *sync.WaitGroup) {
 			defer wg.Done()
 
-			conCfg := consumerConfigLegacy(sub, i.Config)
+			conCfg := consumerConfigLegacy(sub, startTime, i.Config)
 
 			c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
 
