@@ -6,11 +6,14 @@ import (
 	"time"
 
 	"github.com/invopop/jsonschema"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
+	"github.com/olpie101/fast-forward/projection"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 )
 
-type EndpointAttacher func(context.Context, micro.Group) error
+type EndpointAttacher func(context.Context, micro.Group, ...EndpointOption) error
 type EndpointAttacherSet []EndpointAttacher
 
 func (e EndpointAttacherSet) Endpoints() []EndpointAttacher {
@@ -29,15 +32,17 @@ type ErrorFunc func(err error) (string, string, []byte, micro.Headers)
 type ContextFunc func(context.Context, string, micro.Headers) context.Context
 
 type endpointOpts struct {
-	metadata    map[string]string
-	timeout     time.Duration
-	fn          Handler
-	ctx         context.Context
-	ctxFn       ContextFunc
-	decFn       DecoderFunc
-	encFn       EncoderFunc
-	errFn       ErrorFunc
-	middlewares []Middleware
+	metadata            map[string]string
+	timeout             time.Duration
+	fn                  Handler
+	ctx                 context.Context
+	ctxFn               ContextFunc
+	decFn               DecoderFunc
+	encFn               EncoderFunc
+	errFn               ErrorFunc
+	logger              *zap.SugaredLogger
+	loggerRequestFields []interface{}
+	middlewares         []Middleware
 }
 
 func (o *endpointOpts) Handler() micro.Handler {
@@ -46,38 +51,48 @@ func (o *endpointOpts) Handler() micro.Handler {
 		fn = mw(fn)
 	}
 	return micro.ContextHandler(o.ctx, func(ctx context.Context, r micro.Request) {
+		start := time.Now()
 		ctx = o.ctxFn(ctx, r.Subject(), r.Headers())
 		ctx, cancel := handlerCtx(ctx, o.timeout)
+		var err error
+		var b []byte
 		defer cancel()
+		defer func() {
+			reqLen := len(r.Data())
+			if err != nil {
+				code, desc, d, h := wrappedErrorFn(err, o.errFn)
+				respLen := len(d)
+				o.logger.With(o.loggerRequestFields...).Errorw("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", code, "err", err, "micro_error_response", desc)
+
+				err := r.Error(code, desc, d, micro.WithHeaders(h))
+				if err != nil {
+					o.logger.With(o.loggerRequestFields...).Errorw("error responding to request", "err", err)
+				}
+				return
+			}
+			respLen := len(b)
+			o.logger.With(o.loggerRequestFields...).Infow("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", 200)
+		}()
 
 		req, err := o.decFn(r.Data())
 		if err != nil {
-			wrapError(r, err, o.errFn)
-			return
-		}
-
-		if err != nil {
-			wrapError(r, err, o.errFn)
 			return
 		}
 
 		res, err := fn(ctx, req)
 		if err != nil {
-			wrapError(r, err, o.errFn)
 			return
 		}
 
-		b, err := o.encFn(res)
+		b, err = o.encFn(res)
 
 		if err != nil {
-			wrapError(r, err, o.errFn)
 			return
 		}
 
 		err = r.Respond(b)
 
 		if err != nil {
-			wrapError(r, err, o.errFn)
 			return
 		}
 	})
@@ -91,11 +106,12 @@ func handlerCtx(ctx context.Context, t time.Duration) (context.Context, context.
 	return context.WithTimeout(ctx, t)
 }
 
-func wrapError(r micro.Request, err error, fn ErrorFunc) {
-	code, desc, d, h := fn(err)
-
-	r.Error(code, desc, d, micro.WithHeaders(h))
-	// TODO: should take a logger of some kind to log this message
+func wrappedErrorFn(err error, errFn ErrorFunc) (string, string, []byte, micro.Headers) {
+	code, desc, d, h := errFn(err)
+	if code == "" {
+		return defaultErrorFunc(err)
+	}
+	return code, desc, d, h
 }
 
 func defaultEndpointOptions(fn Handler) *endpointOpts {
@@ -111,8 +127,9 @@ func defaultEndpointOptions(fn Handler) *endpointOpts {
 			return json.Marshal(v)
 		},
 		errFn: func(err error) (string, string, []byte, micro.Headers) {
-			return "500", err.Error(), nil, nil
+			return "", err.Error(), nil, nil
 		},
+		logger:      zap.NewNop().Sugar(),
 		middlewares: make([]Middleware, 0),
 	}
 }
@@ -202,6 +219,17 @@ func WithEncoderFn(fn EncoderFunc) EndpointOption {
 	}
 }
 
+func defaultErrorFunc(err error) (string, string, []byte, micro.Headers) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "408", "request timed out", nil, nil
+	} else if errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, projection.ErrNotFound) {
+		return "404", "not found", nil, nil
+	} else if errors.Is(err, ErrDecodingError) {
+		return "400", "invalid request", nil, nil
+	}
+	return "500", "an unknown error occurred", nil, nil
+}
+
 func WithErrFn(fn ErrorFunc) EndpointOption {
 	return func(e *endpointOpts) error {
 		if fn == nil {
@@ -216,6 +244,28 @@ func WithErrFn(fn ErrorFunc) EndpointOption {
 func WithMiddlewares(mws ...Middleware) EndpointOption {
 	return func(e *endpointOpts) error {
 		e.middlewares = mws
+		return nil
+	}
+}
+
+func WithLogger(logger *zap.SugaredLogger, args ...interface{}) EndpointOption {
+	return func(e *endpointOpts) error {
+		if len(args)%2 != 0 {
+			return errors.New("logger fields has odd number of entries")
+		}
+
+		e.logger = logger.With(args...)
+		return nil
+	}
+}
+
+func WithLoggerRequestFields(args ...interface{}) EndpointOption {
+	return func(e *endpointOpts) error {
+		if len(args)%2 != 0 {
+			return errors.New("logger request fields has odd number of entries")
+		}
+
+		e.loggerRequestFields = args
 		return nil
 	}
 }
