@@ -71,7 +71,7 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 			ctx,
 			errs,
 			func(e error) error {
-				logger.Errorw("projection err", "worker_name", name, "err", err)
+				logger.Errorw("projection err", "worker_name", name, "err", e)
 				return fmt.Errorf("projection error occurred (%s): %w", name, e)
 			},
 		)
