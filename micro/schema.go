@@ -44,5 +44,9 @@ func createSchema(reflector jsonschema.Reflector, v interface{}) ([]byte, error)
 
 func extractName(v interface{}) string {
 	t := reflect.TypeOf(v)
-	return t.Elem().Name()
+
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Name()
 }
