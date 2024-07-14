@@ -13,16 +13,9 @@ import (
 	"go.uber.org/zap"
 )
 
-type EndpointAttacher func(context.Context, micro.Group, ...EndpointOption) error
-type EndpointAttacherSet []EndpointAttacher
-
-func (e EndpointAttacherSet) Endpoints() []EndpointAttacher {
-	return e
-}
-
-type Endpointer interface {
-	Endpoints() []EndpointAttacher
-}
+type AttacherFunc func(ctx context.Context, mcfg MicroEndpointConfig, group micro.Group) error
+type AttacherListFunc func() []AttacherFunc
+type EndpointAttacher AttacherListFunc
 
 type EndpointOption func(*endpointOpts) error
 
@@ -267,5 +260,28 @@ func WithLoggerRequestFields(args ...interface{}) EndpointOption {
 
 		e.loggerRequestFields = args
 		return nil
+	}
+}
+
+func WrapEndpointOptions(mo MicroEndpointConfig, subject string, baseOptions []EndpointOption) []EndpointOption {
+	options := append(
+		[]EndpointOption{
+			WithErrFn(mo.errFn),
+			WithLogger(mo.logger, mo.loggerFields...),
+			WithLoggerRequestFields("subject", subject),
+		},
+		baseOptions...,
+	)
+
+	return options
+}
+
+func WrapTypedEndpoint[R any, T any](fn HandlerTyped[R, T]) Handler {
+	return func(ctx context.Context, r any) (any, error) {
+		req, ok := r.(R)
+		if !ok {
+			return nil, ErrDecodingError
+		}
+		return fn(ctx, req)
 	}
 }
