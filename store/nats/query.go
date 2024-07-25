@@ -14,7 +14,14 @@ import (
 )
 
 func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error, error) {
-	subCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	var subCtx context.Context
+	var cancel context.CancelFunc
+	_, ok := ctx.Deadline()
+	if !ok {
+		subCtx, cancel = context.WithTimeout(ctx, 120*time.Second)
+	} else {
+		subCtx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 	start := time.Now()
 
