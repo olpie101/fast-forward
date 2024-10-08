@@ -1,0 +1,4 @@
+venv/
+creds
+test_auth_service.py
+service/
