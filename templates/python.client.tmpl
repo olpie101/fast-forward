@@ -8,10 +8,7 @@ from nats.aio.client import Client as NATS
 
 # Request and Response Types
 {{range $endpoint := .Endpoints}}
-{{.Schema.RequestType}}
-
-{{.Schema.ResponseType}}
-
+{{.InterfaceData}}
 {{end}}
 
 class {{.Name}}:
