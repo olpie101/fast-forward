@@ -1,0 +1,67 @@
+package client
+import (
+    "context"
+    "encoding/json"
+    "errors"
+    "fmt"
+    
+    "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go/micro"
+
+    {{ if gt (len .ImportPackage) 0 }}
+    "{{ .ImportPackage }}"
+    {{ end }}
+)
+
+type {{.Name}} interface {
+    {{range $endpoint := .Endpoints}}
+    {{.Name}} (ctx context.Context, req {{$.PackagePrefix}}.{{.Schema.Request}}) (*{{$.PackagePrefix}}.{{.Schema.Response}}, error)
+    {{end}}
+}
+
+type {{.Name}}Nats struct {
+    nc *nats.Conn
+}
+
+
+var _ {{.Name}} = (*{{.Name}}Nats)(nil)
+
+func {{.Name}}Client(nc *nats.Conn) ({{.Name}}, error) {
+    if nc == nil {
+		return nil, errors.New("connection cannot be nil")
+	}
+	if !nc.IsConnected() {
+		return nil, errors.New("connection is not connected")
+	}
+
+    return &{{.Name}}Nats {
+        nc: nc,
+    }, nil
+}
+
+{{range $endpoint := .Endpoints}}
+func (c *{{$.Name}}Nats) {{.Name}}(ctx context.Context, req {{$.PackagePrefix}}.{{.Schema.Request}}) (*{{$.PackagePrefix}}.{{.Schema.Response}}, error) {
+    b, err := json.Marshal(req)
+    if err != nil {
+        return nil, err
+    }
+
+    msg, err := c.nc.RequestWithContext(ctx, "{{.Subject}}", b)
+    if err != nil {
+        return nil, err
+    }
+
+    errCode := msg.Header.Get(micro.ErrorCodeHeader)
+    if len(errCode) > 0 {
+        return nil, fmt.Errorf("(%s) %s", errCode, msg.Header.Get(micro.ErrorHeader))
+    }
+
+    var resp {{$.PackagePrefix}}.{{.Schema.Response}}
+    err = json.Unmarshal(msg.Data, &resp)
+    
+    if err != nil {
+        return nil, err
+    }
+    return &resp, nil
+}
+{{end}}

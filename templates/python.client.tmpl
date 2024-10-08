@@ -1,0 +1,61 @@
+# pylint: disable=unused-argument, invalid-name
+import asyncio
+import json
+from typing import Any, Dict, Optional, List, TypedDict
+from nats.aio.msg import Msg
+from nats.aio.errors import ErrTimeout, ErrConnectionClosed
+from nats.aio.client import Client as NATS
+
+# Request and Response Types
+{{range $endpoint := .Endpoints}}
+{{.InterfaceData}}
+{{end}}
+
+class {{.Name}}:
+    def __init__(
+        self,
+        nc: NATS,
+        token: str,
+        {{ if gt $.SubjectParamsCount 0 }}
+        subject_params: {{.SubjectParams}},
+        {{end}}
+    ):
+        self.nc = nc
+        self.token = token if token is not None else 'unknown'
+        {{ if gt $.SubjectParamsCount 0 }}
+        self.subject_params = subject_params
+        {{end}}
+
+    {{range $endpoint := .Endpoints}}
+    async def {{.Name}}(self, req: {{.Schema.Request}}) -> {{.Schema.Response}}:
+        ep = "{{.Subject}}"
+        {{ if gt $.SubjectParamsCount 0 }}
+        for param in self.subject_params:
+            ep = ep.replace("*", param, 1)
+        {{end}}
+        headers = {
+            "token": self.token
+        }
+        try:
+            msg: Msg = await self.nc.request(
+                subject=ep,
+                payload=json.dumps(req).encode(),
+                headers=headers,
+                timeout=30
+            )
+            if msg.headers and msg.headers.get("Status") == "503":
+                raise ServiceError.from_msg(msg)
+        except (ErrTimeout, ErrConnectionClosed) as err:
+            raise err
+        resp = json.loads(msg.data.decode())
+        return resp
+    {{end}}
+
+class ServiceError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+    @classmethod
+    def from_msg(cls, msg: Msg) -> 'ServiceError':
+        error_message = msg.data.decode() if msg.data else "Service Error"
+        return cls(error_message)

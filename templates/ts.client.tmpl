@@ -1,0 +1,53 @@
+/* eslint-disable */
+import { JSONCodec, Msg, MsgHdrsImpl, NatsConnection, ServiceError } from "nats.ws";
+
+export class {{.Name}} {
+    private readonly nc: NatsConnection;
+    private token: string
+    {{ if gt .SubjectParamsCount 0 }}
+    private readonly subjectParams: {{.SubjectParams}};
+    {{end}}
+    constructor (nc: NatsConnection, token: any {{ if gt .SubjectParamsCount 0 }}, subjectParams: {{.SubjectParams}} {{end}})  {
+        this.nc = nc;
+        this.token = token ?? 'unknown'
+        {{ if gt .SubjectParamsCount 0 }}
+        this.subjectParams = subjectParams;
+        {{end}}
+    }
+
+    {{range $endpoint := .Endpoints}}
+    public async {{.Name}} (req: {{.Schema.Request}}): Promise<{{.Schema.Response}}> {
+        let ep = "{{.Subject}}";
+        {{ if gt $.SubjectParamsCount 0 }}
+        this.subjectParams.forEach((param) => {
+            ep = ep.replace("*", param);
+        });
+        {{end}}
+        const h = new MsgHdrsImpl();
+        h.set("token", this.token);
+        let m: Msg;
+        try{
+            m = await this.nc.request(
+                ep,
+                JSONCodec<{{.Schema.Request}}>().encode(req),
+                { 
+                    headers: h,
+                    timeout: 30000,
+                }
+            );
+            if (ServiceError.isServiceError(m)){
+                return await Promise.reject(ServiceError.toServiceError(m))
+            }
+        }catch(err) {
+          return await Promise.reject(err);
+        }
+
+        const resp = JSONCodec<{{.Schema.Response}}>().decode(m.data);
+        return resp;
+    }
+    {{end}}
+}
+
+{{range $endpoint := .Endpoints}}
+{{.InterfaceData}}
+{{end}}
