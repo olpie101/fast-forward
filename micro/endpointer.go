@@ -99,7 +99,40 @@ func handlerCtx(ctx context.Context, t time.Duration) (context.Context, context.
 	return context.WithTimeout(ctx, t)
 }
 
+type ServiceError struct {
+	err     error
+	code    string
+	body    []byte
+	headers map[string][]string
+}
+
+func NewError(err error, code string, body []byte, headers map[string][]string) ServiceError {
+	if _, ok := err.(ServiceError); !ok {
+		err = errors.Wrap(err, "service error")
+	}
+	return ServiceError{
+		err:     err,
+		code:    code,
+		body:    body,
+		headers: headers,
+	}
+}
+
+func (e ServiceError) Error() string {
+	return e.err.Error()
+}
+
+func (e ServiceError) ErrorParts() (string, string, []byte, micro.Headers) {
+	return e.Error(), e.code, e.body, e.headers
+}
+
 func wrappedErrorFn(err error, errFn ErrorFunc) (string, string, []byte, micro.Headers) {
+	var serr ServiceError
+	ok := errors.As(err, &serr)
+
+	if ok {
+		return serr.ErrorParts()
+	}
 	code, desc, d, h := errFn(err)
 	if code == "" {
 		return defaultErrorFunc(err)
