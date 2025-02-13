@@ -106,11 +106,11 @@ type ServiceError struct {
 	headers map[string][]string
 }
 
-func NewError(err error, code string, body []byte, headers map[string][]string) ServiceError {
-	if _, ok := err.(ServiceError); !ok {
+func NewError(err error, code string, body []byte, headers map[string][]string) *ServiceError {
+	if ok := errors.Is(err, &ServiceError{}); !ok {
 		err = errors.Wrap(err, "service error")
 	}
-	return ServiceError{
+	return &ServiceError{
 		err:     err,
 		code:    code,
 		body:    body,
