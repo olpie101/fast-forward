@@ -122,6 +122,19 @@ func (e ServiceError) Error() string {
 	return e.err.Error()
 }
 
+func (e *ServiceError) Is(target error) bool {
+	// If target is a ServiceError, compare codes and underlying errors
+	if t, ok := target.(*ServiceError); ok {
+		return e.code == t.code && errors.Is(e.err, t.err)
+	}
+	// If not, check if our wrapped error matches the target
+	return errors.Is(e.err, target)
+}
+
+func (e *ServiceError) Unwrap() error {
+	return e.err
+}
+
 func (e ServiceError) ErrorParts() (string, string, []byte, micro.Headers) {
 	return e.Error(), e.code, e.body, e.headers
 }
