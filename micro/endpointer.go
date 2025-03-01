@@ -269,7 +269,7 @@ func WithErrFn(fn ErrorFunc) EndpointOption {
 
 func WithMiddlewares(mws ...Middleware) EndpointOption {
 	return func(e *endpointOpts) error {
-		e.middlewares = mws
+		e.middlewares = append(e.middlewares, mws...)
 		return nil
 	}
 }
@@ -302,6 +302,7 @@ func WrapEndpointOptions(mo MicroEndpointConfig, subject string, baseOptions []E
 			WithErrFn(mo.errFn),
 			WithLogger(mo.logger, mo.loggerFields...),
 			WithLoggerRequestFields("subject", subject),
+			WithMiddlewares(mo.mws...),
 		},
 		baseOptions...,
 	)
