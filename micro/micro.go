@@ -13,12 +13,14 @@ type microOpts struct {
 	s      micro.Service
 	errFn  ErrorFunc
 	logger *zap.SugaredLogger
+	mws    []Middleware
 }
 
 type MicroEndpointConfig struct {
 	errFn        ErrorFunc
 	logger       *zap.SugaredLogger
 	loggerFields []any
+	mws          []Middleware
 }
 
 func MicroOptions(cfg micro.Config) *microOpts {
@@ -68,6 +70,7 @@ func (mo *microOpts) EndpointConfig() MicroEndpointConfig {
 		errFn:        mo.errFn,
 		logger:       mo.logger,
 		loggerFields: mo.loggerFields(),
+		mws:          mo.mws,
 	}
 }
 
@@ -77,6 +80,13 @@ func WithMicroLogger(logger *zap.SugaredLogger) MicroOption {
 			return errors.New("logger cannot be nil")
 		}
 		mo.logger = logger
+		return nil
+	}
+}
+
+func WithMicroMiddlewares(mws ...Middleware) MicroOption {
+	return func(mo *microOpts) error {
+		mo.mws = mws
 		return nil
 	}
 }
