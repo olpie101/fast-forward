@@ -118,16 +118,16 @@ func NewError(err error, code string, body []byte, headers map[string][]string) 
 	}
 }
 
-func (e ServiceError) Error() string {
+func (e *ServiceError) Error() string {
 	return e.err.Error()
 }
 
-func (e ServiceError) ErrorParts() (string, string, []byte, micro.Headers) {
-	return e.Error(), e.code, e.body, e.headers
+func (e *ServiceError) ErrorParts() (string, string, []byte, micro.Headers) {
+	return e.code, e.Error(), e.body, e.headers
 }
 
 func wrappedErrorFn(err error, errFn ErrorFunc) (string, string, []byte, micro.Headers) {
-	var serr ServiceError
+	var serr *ServiceError
 	ok := errors.As(err, &serr)
 
 	if ok {
