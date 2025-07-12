@@ -52,19 +52,23 @@ func (o *endpointOpts) Handler() micro.Handler {
 		defer cancel()
 		defer func() {
 			reqLen := len(r.Data())
+			// Get dynamic fields from context
+			dynamicFields := LoggerFieldsFromContext(ctx)
+			allFields := append(o.loggerRequestFields, dynamicFields...)
+
 			if err != nil {
 				code, desc, d, h := wrappedErrorFn(err, o.errFn)
 				respLen := len(d)
-				o.logger.With(o.loggerRequestFields...).Errorw("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", code, "err", err, "micro_error_response", desc)
+				o.logger.With(allFields...).Errorw("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", code, "err", err, "micro_error_response", desc)
 
 				err := r.Error(code, desc, d, micro.WithHeaders(h))
 				if err != nil {
-					o.logger.With(o.loggerRequestFields...).Errorw("error responding to request", "err", err)
+					o.logger.With(allFields...).Errorw("error responding to request", "err", err)
 				}
 				return
 			}
 			respLen := len(b)
-			o.logger.With(o.loggerRequestFields...).Infow("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", 200)
+			o.logger.With(allFields...).Infow("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", 200)
 		}()
 
 		req, err := o.decFn(r.Data())
