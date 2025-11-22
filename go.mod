@@ -1,6 +1,6 @@
 module github.com/olpie101/fast-forward
 
-go 1.21
+go 1.22.2
 
 require (
 	github.com/gobeam/stringy v0.0.7

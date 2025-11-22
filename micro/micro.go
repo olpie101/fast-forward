@@ -1,6 +1,8 @@
 package micro
 
 import (
+	"encoding/json"
+
 	"github.com/nats-io/nats.go/micro"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -11,12 +13,14 @@ type MicroOption func(*microOpts) error
 type microOpts struct {
 	cfg    micro.Config
 	s      micro.Service
+	encFn  EncoderFunc
 	errFn  ErrorFunc
 	logger *zap.SugaredLogger
 	mws    []Middleware
 }
 
 type MicroEndpointConfig struct {
+	encFn        EncoderFunc
 	errFn        ErrorFunc
 	logger       *zap.SugaredLogger
 	loggerFields []any
@@ -27,17 +31,18 @@ func MicroOptions(cfg micro.Config) *microOpts {
 	return &microOpts{
 		cfg:    cfg,
 		logger: zap.NewNop().Sugar(),
+		encFn:  JsonEncoderFunc,
 		errFn: func(err error) (string, string, []byte, micro.Headers) {
 			return "", "", nil, nil
 		},
 	}
 }
 
-func (mo *microOpts) EndpointOptions() []EndpointOption {
-	return []EndpointOption{
-		WithLogger(mo.logger),
-	}
-}
+// func (mo *microOpts) EndpointOptions() []EndpointOption {
+// 	return []EndpointOption{
+// 		WithLogger(mo.logger),
+// 	}
+// }
 
 func (mo *microOpts) WithService(s micro.Service) {
 	mo.s = s
@@ -67,6 +72,7 @@ func (mo *microOpts) MicroConfig() micro.Config {
 
 func (mo *microOpts) EndpointConfig() MicroEndpointConfig {
 	return MicroEndpointConfig{
+		encFn:        mo.encFn,
 		errFn:        mo.errFn,
 		logger:       mo.logger,
 		loggerFields: mo.loggerFields(),
@@ -87,6 +93,23 @@ func WithMicroLogger(logger *zap.SugaredLogger) MicroOption {
 func WithMicroMiddlewares(mws ...Middleware) MicroOption {
 	return func(mo *microOpts) error {
 		mo.mws = mws
+		return nil
+	}
+}
+
+func WithPrependMiddlewares(mws ...Middleware) MicroOption {
+	return func(mo *microOpts) error {
+		mo.mws = append(mws, mo.mws...)
+		return nil
+	}
+}
+
+func WithEncoderFunc(fn EncoderFunc) MicroOption {
+	return func(mo *microOpts) error {
+		if fn == nil {
+			return errors.New("encoder function cannot be nil")
+		}
+		mo.encFn = fn
 		return nil
 	}
 }
@@ -124,4 +147,8 @@ func loggerFieldsFromService(s micro.Service) []any {
 		"micro_id", info.ID,
 		"micro_version", info.Version,
 	}
+}
+
+func JsonEncoderFunc(v any) ([]byte, error) {
+	return json.Marshal(v)
 }
