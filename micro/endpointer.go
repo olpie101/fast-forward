@@ -3,6 +3,7 @@ package micro
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/invopop/jsonschema"
@@ -44,54 +45,46 @@ func (o *endpointOpts) Handler() micro.Handler {
 		fn = mw(fn)
 	}
 	return micro.ContextHandler(o.ctx, func(ctx context.Context, r micro.Request) {
-		start := time.Now()
+		loggingFields := append(o.loggerRequestFields, "micro_request_length", len(r.Data()))
+		ctx = WithLoggerFields(ctx, loggingFields...)
 		ctx = o.ctxFn(ctx, r.Subject(), r.Headers())
 		ctx, cancel := handlerCtx(ctx, o.timeout)
 		var err error
+		var respErr error
 		var b []byte
 		defer cancel()
 		defer func() {
-			reqLen := len(r.Data())
-			// Get dynamic fields from context
-			dynamicFields := LoggerFieldsFromContext(ctx)
-			allFields := append(o.loggerRequestFields, dynamicFields...)
-
-			if err != nil {
-				code, desc, d, h := wrappedErrorFn(err, o.errFn)
-				respLen := len(d)
-				o.logger.With(allFields...).Errorw("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", code, "err", err, "micro_error_response", desc)
-
-				err := r.Error(code, desc, d, micro.WithHeaders(h))
-				if err != nil {
-					o.logger.With(allFields...).Errorw("error responding to request", "err", err)
-				}
+			if err == nil {
 				return
 			}
-			respLen := len(b)
-			o.logger.With(allFields...).Infow("complete", "d", time.Since(start), "micro_request_length", reqLen, "micro_response_length", respLen, "code", 200)
+			code, desc, d, h := wrappedErrorFn(err, o.errFn)
+			fmt.Println("returning error", code, desc, d, h)
+			respErr = r.Error(code, desc, d, micro.WithHeaders(h))
+			fmt.Println("returned error")
+			_ = respErr
 		}()
 
 		req, err := o.decFn(r.Data())
 		if err != nil {
+			fmt.Println("returning error after  dec func")
 			return
 		}
 
 		res, err := fn(ctx, req)
 		if err != nil {
+			fmt.Println("returning error after func")
+
 			return
 		}
 
 		b, err = o.encFn(res)
 
 		if err != nil {
+			fmt.Println("returning error after enc func")
 			return
 		}
 
-		err = r.Respond(b)
-
-		if err != nil {
-			return
-		}
+		respErr = r.Respond(b)
 	})
 
 }
@@ -152,9 +145,6 @@ func defaultEndpointOptions(fn Handler) *endpointOpts {
 		ctx:      context.Background(),
 		ctxFn: func(ctx context.Context, s string, h micro.Headers) context.Context {
 			return ctx
-		},
-		encFn: func(v any) ([]byte, error) {
-			return json.Marshal(v)
 		},
 		errFn: func(err error) (string, string, []byte, micro.Headers) {
 			return "", err.Error(), nil, nil
@@ -301,12 +291,16 @@ func WithLoggerRequestFields(args ...interface{}) EndpointOption {
 }
 
 func WrapEndpointOptions(mo MicroEndpointConfig, subject string, baseOptions []EndpointOption) []EndpointOption {
+	loggerFields := []any{"endpoint", subject}
+	loggerFields = append(loggerFields, mo.loggerFields...)
+	mws := append([]Middleware{requestLogger(mo.logger, mo.encFn, mo.errFn)}, mo.mws...)
 	options := append(
 		[]EndpointOption{
+			WithEncoderFn(mo.encFn),
 			WithErrFn(mo.errFn),
 			WithLogger(mo.logger, mo.loggerFields...),
-			WithLoggerRequestFields("subject", subject),
-			WithMiddlewares(mo.mws...),
+			WithLoggerRequestFields(loggerFields...),
+			WithMiddlewares(mws...),
 		},
 		baseOptions...,
 	)
