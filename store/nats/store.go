@@ -336,9 +336,10 @@ func (s *Store) getOrCreateCurrentVersion(ctx context.Context, key string) (uint
 	}
 	if notFound {
 		rev, err = s.versionKV.Create(ctx, key, &kv.UInt64Value{Value: 0})
-		if err != nil && !notFound {
+		if err != nil {
 			return 0, 0, err
 		}
+		return 0, rev, nil
 	}
 	return v.Value, rev, nil
 }
