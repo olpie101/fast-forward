@@ -7,7 +7,7 @@ import (
 )
 
 func DebounceReady(debounceTime time.Duration, ready chan struct{}) func(evt event.Event, original func(event.Event)) {
-	t := time.NewTicker(debounceTime)
+	t := time.NewTimer(debounceTime)
 	fn := func(evt event.Event, original func(event.Event)) {
 		t.Reset(debounceTime)
 		original(evt)
