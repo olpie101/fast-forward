@@ -164,6 +164,30 @@ func TestPut(t *testing.T) {
 	if gotRev != 2 || v.Value != 2 {
 		t.Fatalf("Get after Put = (%#v, %d), want (Value:2, rev:2)", v, gotRev)
 	}
+
+	t.Run("marshal error propagates and bucket unchanged", func(t *testing.T) {
+		kv2, bucket, _ := newKV[*failingValue](t)
+		// Pre-populate so we can verify Put-with-marshal-error doesn't add or
+		// rewrite keys.
+		if _, err := bucket.PutString("seed", "raw"); err != nil {
+			t.Fatalf("PutString seed: %v", err)
+		}
+		sentinel := errors.New("put marshal boom")
+		rev, err := kv2.Put(context.Background(), "k", &failingValue{err: sentinel})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("Put err = %v, want %v", err, sentinel)
+		}
+		if rev != 0 {
+			t.Fatalf("Put rev = %d, want 0", rev)
+		}
+		keys, err := bucket.Keys()
+		if err != nil && !errors.Is(err, nats.ErrNoKeysFound) {
+			t.Fatalf("bucket.Keys err = %v", err)
+		}
+		if len(keys) != 1 || keys[0] != "seed" {
+			t.Fatalf("bucket keys = %v, want [seed]", keys)
+		}
+	})
 }
 
 func TestUpdate(t *testing.T) {
@@ -198,6 +222,36 @@ func TestUpdate(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "wrong last sequence") {
 			t.Fatalf("Update err = %v, want contains 'wrong last sequence'", err)
+		}
+	})
+
+	t.Run("marshal error propagates and bucket unchanged", func(t *testing.T) {
+		kv2, bucket, _ := newKV[*failingValue](t)
+		if _, err := bucket.PutString("k", "raw"); err != nil {
+			t.Fatalf("PutString seed: %v", err)
+		}
+		// Capture pre-state revision.
+		entry, err := bucket.Get("k")
+		if err != nil {
+			t.Fatalf("bucket.Get seed: %v", err)
+		}
+		seedRev := entry.Revision()
+
+		sentinel := errors.New("update marshal boom")
+		rev, err := kv2.Update(context.Background(), "k", &failingValue{err: sentinel}, seedRev)
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("Update err = %v, want %v", err, sentinel)
+		}
+		if rev != 0 {
+			t.Fatalf("Update rev = %d, want 0", rev)
+		}
+		// Revision must be unchanged.
+		after, err := bucket.Get("k")
+		if err != nil {
+			t.Fatalf("bucket.Get after: %v", err)
+		}
+		if after.Revision() != seedRev {
+			t.Fatalf("bucket revision = %d, want unchanged %d", after.Revision(), seedRev)
 		}
 	})
 }

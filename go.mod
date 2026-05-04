@@ -10,13 +10,12 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/invopop/jsonschema v0.12.0
 	github.com/modernice/goes v0.4.6
+	github.com/nats-io/nats-server/v2 v2.10.12
 	github.com/nats-io/nats.go v1.47.0
 	github.com/pkg/errors v0.9.1
 	go.uber.org/zap v1.27.0
 	golang.org/x/exp v0.0.0-20240409090435-93d18d7e34b8
 )
-
-require golang.org/x/sync v0.13.0 // indirect
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
@@ -25,7 +24,6 @@ require (
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/minio/highwayhash v1.0.2 // indirect
 	github.com/nats-io/jwt/v2 v2.5.5 // indirect
-	github.com/nats-io/nats-server/v2 v2.10.12 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
