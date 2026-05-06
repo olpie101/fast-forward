@@ -1,8 +1,6 @@
 package nats
 
 import (
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/modernice/goes/codec"
@@ -12,20 +10,9 @@ import (
 
 func TestStoreNewIntegration(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		s, _, nc := newStore(t, "ok")
+		s, _, _ := newStore(t, "ok")
 		if s == nil {
 			t.Fatal("Store is nil")
-		}
-		// P1-4: subFn cannot be compared (unexported, method values are not
-		// equality-comparable). Pin the non-legacy branch by checking that the
-		// embedded server reports a version that routes through s.subscribe at
-		// store.go:80 (major>=2 && minor>=10). End-to-end coverage is provided
-		// by TestQueryIntegration's insert+query round-trip — that path only
-		// succeeds when subFn == s.subscribe.
-		v := nc.ConnectedServerVersion()
-		major, minor := parseMajorMinor(t, v)
-		if !(major > 2 || (major == 2 && minor >= 10)) {
-			t.Fatalf("connected server version %q does not select the non-legacy branch", v)
 		}
 	})
 
@@ -92,22 +79,5 @@ func TestStoreNewIntegration(t *testing.T) {
 }
 
 func TestStoreNewIntegrationIsLegacyMalformed(t *testing.T) {
-	t.Skip("store/nats/store.go:202-219 isLegacy panics on malformed server version: parts[0]/parts[1] indexed without len check; desired: return error if len(parts) < 2. The embedded nats-server reports a real version so this path is not naturally reachable from the integration harness; pure-unit characterizes the panic via TestIsLegacyShortVersionPanics.")
-}
-
-func parseMajorMinor(t *testing.T, version string) (int, int) {
-	t.Helper()
-	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		t.Fatalf("unparseable version %q", version)
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		t.Fatalf("major: %v", err)
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		t.Fatalf("minor: %v", err)
-	}
-	return major, minor
+	t.Skip("checkServerVersion now returns ErrUnsupportedServerVersion for malformed/<2.10 versions; covered by TestCheckServerVersion. Reaching this branch in integration would require a faked nats.Conn, which is out of scope for the embedded-server harness.")
 }

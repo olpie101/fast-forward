@@ -15,47 +15,39 @@ import (
 	"github.com/olpie101/fast-forward/kv"
 )
 
-func TestIsLegacy(t *testing.T) {
+func TestCheckServerVersion(t *testing.T) {
 	tests := []struct {
 		version string
-		want    bool
 		wantErr bool
 	}{
-		{version: "2.9.99", want: true},
-		{version: "1.99.0", want: true},
-		{version: "2.10.0", want: false},
-		{version: "2.10.1", want: false},
-		{version: "3.0.0", want: false},
+		{version: "2.10.0"},
+		{version: "2.10.1"},
+		{version: "3.0.0"},
+		{version: "2.9.99", wantErr: true},
+		{version: "1.99.0", wantErr: true},
 		{version: "x.10.0", wantErr: true},
 		{version: "2.x.0", wantErr: true},
+		{version: "2", wantErr: true},
+		{version: "", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.version, func(t *testing.T) {
-			got, err := isLegacy(tt.version)
+			err := checkServerVersion(tt.version)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatal("isLegacy() error = nil, want error")
+					t.Fatal("checkServerVersion() error = nil, want error")
+				}
+				if !errors.Is(err, ErrUnsupportedServerVersion) {
+					t.Fatalf("checkServerVersion() error = %v, want errors.Is ErrUnsupportedServerVersion", err)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("isLegacy() error = %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("isLegacy() = %v, want %v", got, tt.want)
+				t.Fatalf("checkServerVersion() error = %v", err)
 			}
 		})
 	}
-}
-
-func TestIsLegacyShortVersionPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("isLegacy(\"2\") did not panic; update this characterization if production behavior changes")
-		}
-	}()
-	_, _ = isLegacy("2")
 }
 
 func TestValidateStore(t *testing.T) {

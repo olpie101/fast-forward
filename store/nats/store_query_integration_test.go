@@ -366,7 +366,3 @@ func TestQueryIntegrationMalformedSubjectPanic_Skip(t *testing.T) {
 func TestQuerySyncCollectTODO_Skip(t *testing.T) {
 	t.Skip("store/nats/query.go:84 collect is sync — query() blocks on collect before returning channels; desired: collect concurrently so caller can stream events while consumer is still draining. Characterize by inserting a large batch and asserting first event arrives on evts before collect fully completes.")
 }
-
-func TestQuerySubscribeLegacy_Skip(t *testing.T) {
-	t.Skip("store/nats/query_legacy.go:25-63 subscribeLegacy unreachable from embedded server (reports >=2.10); desired: covered by either pure-unit fakes or a legacy-server matrix outside this plan.")
-}

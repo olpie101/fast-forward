@@ -9,7 +9,6 @@ import (
 	"math"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,7 +32,6 @@ type Store struct {
 	logger          *zap.SugaredLogger
 	aggStreamMapper map[string]string   `options:"-"`
 	evtStreamMapper map[string][]string `options:"-"`
-	subFn           subFn               `options:"-"`
 	retryCount      uint
 	pullExpiry      time.Duration
 	writeLeaseKV    kv.KeyValuer[*kv.NilValue]
@@ -47,8 +45,6 @@ type versionInfo struct {
 	finalVersion uint64
 }
 
-type subFn func(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error)
-
 func defaultStoreOptions() []StoreOption {
 	return []StoreOption{
 		WithLogger(zap.NewNop().Sugar()),
@@ -60,9 +56,8 @@ func defaultStoreOptions() []StoreOption {
 func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error) {
 	options := defaultStoreOptions()
 	options = append(options, opts...)
-	legacy, err := isLegacy(nc.ConnectedServerVersion())
-	if err != nil {
-		return nil, errors.New("store: unable to determine server version")
+	if err := checkServerVersion(nc.ConnectedServerVersion()); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
 	}
 
 	js, err := jetstream.New(nc)
@@ -75,12 +70,6 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 		enc:             enc,
 		aggStreamMapper: map[string]string{},
 		evtStreamMapper: map[string][]string{},
-	}
-
-	s.subFn = s.subscribe
-
-	if legacy {
-		s.subFn = s.subscribeLegacy
 	}
 
 	err = applyStoreOptions(s, options...)
@@ -199,23 +188,30 @@ func normaliseEventName(name string) string {
 	return strings.ReplaceAll(name, ".", "_")
 }
 
-func isLegacy(version string) (bool, error) {
+// ErrUnsupportedServerVersion is returned by New when the connected NATS
+// server is older than 2.10 or its version string cannot be parsed.
+var ErrUnsupportedServerVersion = errors.New("unsupported nats server version")
+
+func checkServerVersion(version string) error {
 	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return fmt.Errorf("%w: %q", ErrUnsupportedServerVersion, version)
+	}
 
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return false, err
+		return fmt.Errorf("%w: %q: parsing major: %w", ErrUnsupportedServerVersion, version, err)
 	}
 	minor, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return false, err
+		return fmt.Errorf("%w: %q: parsing minor: %w", ErrUnsupportedServerVersion, version, err)
 	}
 
 	if major < 2 || (major == 2 && minor < 10) {
-		return true, nil
+		return fmt.Errorf("%w: %q: requires >= 2.10", ErrUnsupportedServerVersion, version)
 	}
 
-	return false, nil
+	return nil
 }
 
 func (s *Store) genPublishMsgs(evts []event.Event, leases map[string]versionInfo) ([]*nats.Msg, error) {

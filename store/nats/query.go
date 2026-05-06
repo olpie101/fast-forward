@@ -69,7 +69,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	}
 
 	for stream, subjects := range groups {
-		go s.subFn(subCtx, &wg, stream, subjects, minTime, push, subErrs)
+		go s.subscribe(subCtx, &wg, stream, subjects, minTime, push, subErrs)
 	}
 
 	go func() {
