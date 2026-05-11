@@ -225,9 +225,9 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 	}
 
 	i := str.CachedInfo()
-	conCfg := consumerConfig(subjects, startTime, i.Config)
+	conCfg := orderedConsumerConfig(subjects, startTime, i.Config)
 
-	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, conCfg)
+	c, err := str.OrderedConsumer(ctx, conCfg)
 
 	if err != nil {
 		errs <- fmt.Errorf("create consumer error (stream: %s): %w", stream, err)
@@ -249,25 +249,15 @@ func normaliseSubject(streamSubject, subject string) string {
 	return strings.Join(subParts, ".")
 }
 
-func defaultConsumerConfig() jetstream.ConsumerConfig {
-	return jetstream.ConsumerConfig{
-		DeliverPolicy:     jetstream.DeliverAllPolicy,
-		AckPolicy:         jetstream.AckExplicitPolicy,
-		ReplayPolicy:      jetstream.ReplayInstantPolicy,
-		InactiveThreshold: 10 * time.Second,
-		Replicas:          1,
-		MemoryStorage:     true,
-	}
-}
-
-func consumerConfig(subjects []string, startTime time.Time, sc jetstream.StreamConfig) jetstream.ConsumerConfig {
+func orderedConsumerConfig(subjects []string, startTime time.Time, sc jetstream.StreamConfig) jetstream.OrderedConsumerConfig {
 	filterSubjects := make([]string, 0, len(subjects))
 	for _, s := range subjects {
 		filterSubjects = append(filterSubjects, normaliseSubject(sc.Subjects[0], s))
 	}
 
-	cfg := defaultConsumerConfig()
-	cfg.FilterSubjects = filterSubjects
+	cfg := jetstream.OrderedConsumerConfig{
+		FilterSubjects: filterSubjects,
+	}
 
 	if !startTime.IsZero() {
 		cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
@@ -296,11 +286,6 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error, ex
 		}
 
 		err = push(msg)
-		if err != nil {
-			return err
-		}
-
-		err = msg.Ack()
 		if err != nil {
 			return err
 		}

@@ -2,11 +2,13 @@ package nats
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/event/query"
 	"github.com/modernice/goes/event/query/version"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 func TestBuildQuery(t *testing.T) {
@@ -133,4 +135,62 @@ func assertStringsEqual(t *testing.T, got, want []string) {
 			t.Fatalf("got[%d] = %q, want %q\ngot:  %#v\nwant: %#v", i, got[i], want[i], got, want)
 		}
 	}
+}
+
+func TestOrderedConsumerConfig(t *testing.T) {
+	streamCfg := jetstream.StreamConfig{Subjects: []string{"es.order.>"}}
+
+	t.Run("zero startTime leaves DeliverAll defaults", func(t *testing.T) {
+		cfg := orderedConsumerConfig(
+			[]string{"es.order." + uuid.New().String() + ".1.*"},
+			time.Time{},
+			streamCfg,
+		)
+		if cfg.DeliverPolicy != jetstream.DeliverAllPolicy {
+			t.Errorf("DeliverPolicy = %v, want DeliverAllPolicy (zero value)", cfg.DeliverPolicy)
+		}
+		if cfg.OptStartTime != nil {
+			t.Errorf("OptStartTime = %v, want nil", cfg.OptStartTime)
+		}
+		if len(cfg.FilterSubjects) != 1 {
+			t.Fatalf("len(FilterSubjects) = %d, want 1", len(cfg.FilterSubjects))
+		}
+	})
+
+	t.Run("non-zero startTime selects DeliverByStartTimePolicy", func(t *testing.T) {
+		start := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
+		cfg := orderedConsumerConfig(
+			[]string{"es.order.*.*.*"},
+			start,
+			streamCfg,
+		)
+		if cfg.DeliverPolicy != jetstream.DeliverByStartTimePolicy {
+			t.Errorf("DeliverPolicy = %v, want DeliverByStartTimePolicy", cfg.DeliverPolicy)
+		}
+		if cfg.OptStartTime == nil {
+			t.Fatal("OptStartTime is nil")
+		}
+		if !cfg.OptStartTime.Equal(start) {
+			t.Errorf("OptStartTime = %v, want %v", *cfg.OptStartTime, start)
+		}
+	})
+
+	t.Run("FilterSubjects normalised against stream subject", func(t *testing.T) {
+		// normaliseSubject substitutes the stream-subject's aggregate-name
+		// segment when the query subject differs. Pass a query subject with
+		// a different aggregate-name segment to exercise the substitution.
+		id := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+		querySubjects := []string{
+			"es.invoice." + id.String() + ".*.*",
+			"es.invoice." + id.String() + ".5.*",
+		}
+		cfg := orderedConsumerConfig(querySubjects, time.Time{}, jetstream.StreamConfig{
+			Subjects: []string{"es.order.>"},
+		})
+		want := []string{
+			"es.order." + id.String() + ".*.*",
+			"es.order." + id.String() + ".5.*",
+		}
+		assertStringsEqual(t, cfg.FilterSubjects, want)
+	})
 }

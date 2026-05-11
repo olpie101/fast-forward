@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/event/query"
+	qtime "github.com/modernice/goes/event/query/time"
 	"github.com/modernice/goes/event/query/version"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // insertEventsAt seeds the harness's stream with the given events, calling
@@ -233,35 +233,88 @@ func TestQueryIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("version_min_uses_fetchVersionMinTime", func(t *testing.T) {
-		// P1-1 fix: option (b) consumer introspection. We do NOT assert the
-		// returned event count because store/nats/query.go:272-275 configures
-		// DeliverByStartTimePolicy + OptStartTime which filters by JetStream
-		// stored publication wall-clock, NOT by event header times. Setting
-		// only evt.Time() and asserting count is FORBIDDEN. Instead we verify
-		// fetchVersionMinTime fired correctly by introspecting the consumer
-		// `subscribe` created via js.Stream(...).ListConsumers and asserting
-		// info.Config.OptStartTime equals the v=2 message header time.
+	t.Run("time_min", func(t *testing.T) {
+		// Exercises subscribe's DeliverByStartTimePolicy path. Replaces the old
+		// consumer-introspection assertion that walked Stream.ListConsumers —
+		// ordered consumers are torn down server-side when the iterator stops,
+		// so the consumer is gone by the time the test inspects.
+		//
+		// Note: the final {3,4} assertion is also enforced by limitGuard
+		// (query_limit_guard.go:57-64 filters by header time post-collect), so
+		// this is an end-to-end correctness check rather than proof that
+		// JetStream-side DeliverByStartTimePolicy filtering ran. Builder
+		// behaviour is pinned by TestOrderedConsumerConfig.
 		h := newHarness(t, "order")
 		h.registerString(eventName)
 
 		aggID := uuid.New()
-		base := time.Now().UTC().Truncate(time.Millisecond)
-		var headerTimeOfV2 time.Time
-		evts := make([]event.Event, 0, 5)
-		for i := 1; i <= 5; i++ {
-			ht := base.Add(time.Duration(i*100) * time.Millisecond)
-			if i == 2 {
-				headerTimeOfV2 = ht
-			}
-			evts = append(evts, mkEvent(t, eventName, aggID, i, ht))
+		t0 := time.Now().UTC().Truncate(time.Millisecond)
+		// Insert v1..v2 stamped at t0; sleep beyond pullExpiry so JetStream
+		// records distinct stored-publish wall-clocks for the two batches —
+		// DeliverByStartTimePolicy filters by stored-publish time, not header
+		// time, so the stored-time gap is the substrate of this test.
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 1, t0))
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 2, t0))
+		time.Sleep(2 * time.Second)
+		t1 := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 3, t1))
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 4, t1))
+
+		cutoff := t1.Add(-500 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, errsCh, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.Time(qtime.Min(cutoff)),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
 		}
-		insertEventsAt(t, h, evts...)
+		got, gotErrs := drainQuery(t, out, errsCh, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 2 {
+			t.Fatalf("len(got) = %d, want 2", len(got))
+		}
+		for _, e := range got {
+			_, _, v := e.Aggregate()
+			if v != 3 && v != 4 {
+				t.Errorf("version %d outside {3,4}", v)
+			}
+		}
+	})
+
+	t.Run("version_min", func(t *testing.T) {
+		// Exercises the query.go:58-69 → fetchVersionMinTime → startTime path.
+		// version.Min(N) is the only constraint that populates
+		// AggregateVersions().Min() and reaches guard.hasMinVersion (see
+		// query_limit_guard.go:38-46); version.InRange does not — so the
+		// version_range subtest above cannot stand in for this one.
+		//
+		// Note: the final {3,4} assertion is also enforced by limitGuard
+		// (query_limit_guard.go:38-45 filters by version post-collect), so
+		// this is an end-to-end correctness check rather than proof that
+		// JetStream-side DeliverByStartTimePolicy filtering ran.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		t0 := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 1, t0))
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 2, t0))
+		// 2s stored-publish gap so DeliverByStartTimePolicy in subscribe (which
+		// filters by stored time, not header time) has a clean cut between the
+		// two batches. Final exclusion of v1/v2 from the result set is also
+		// enforced by the version guard at query_limit_guard.go:38-45.
+		time.Sleep(2 * time.Second)
+		t1 := t0.Add(time.Second)
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 3, t1))
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 4, t1))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// Per query.go:61 fetchVersionMinTime is called with
-		// (guard.minVersion - 1). Choose Min(3) so the lookup targets v=2.
 		out, errsCh, err := h.store.Query(ctx, query.New(
 			query.AggregateName("order"),
 			query.AggregateID(aggID),
@@ -270,38 +323,18 @@ func TestQueryIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query: %v", err)
 		}
-		_, gotErrs := drainQuery(t, out, errsCh, 5*time.Second)
+		got, gotErrs := drainQuery(t, out, errsCh, 5*time.Second)
 		if len(gotErrs) != 0 {
 			t.Fatalf("query errors: %v", gotErrs)
 		}
-
-		// Locate the `subscribe`-created consumer. Both fetchVersionMinTime
-		// and subscribe build ephemeral consumers; disambiguate by
-		// DeliverPolicy == DeliverByStartTimePolicy.
-		str, err := h.js.Stream(ctx, h.streamName)
-		if err != nil {
-			t.Fatalf("Stream: %v", err)
+		if len(got) != 2 {
+			t.Fatalf("len(got) = %d, want 2", len(got))
 		}
-		var startConsumer *jetstream.ConsumerInfo
-		lc := str.ListConsumers(ctx)
-		for info := range lc.Info() {
-			if info.Config.DeliverPolicy == jetstream.DeliverByStartTimePolicy && info.Config.OptStartTime != nil {
-				cp := *info
-				startConsumer = &cp
-				break
+		for _, e := range got {
+			_, _, v := e.Aggregate()
+			if v != 3 && v != 4 {
+				t.Errorf("version %d outside {3,4}", v)
 			}
-		}
-		if err := lc.Err(); err != nil {
-			t.Fatalf("ListConsumers: %v", err)
-		}
-		if startConsumer == nil {
-			t.Fatal("no consumer with DeliverByStartTimePolicy found")
-		}
-		if startConsumer.Config.OptStartTime == nil {
-			t.Fatal("OptStartTime is nil")
-		}
-		if !startConsumer.Config.OptStartTime.Equal(headerTimeOfV2) {
-			t.Fatalf("OptStartTime = %v, want %v (v=2 header time)", startConsumer.Config.OptStartTime, headerTimeOfV2)
 		}
 	})
 
