@@ -121,14 +121,48 @@ func (s *Store) streamFunc(subject string) ([]string, error) {
 	hasAggregate := parts[1] != "*"
 	hasEvent := parts[4] != "*"
 	if hasAggregate {
+		s.streamMapperMu.RLock()
+		defer s.streamMapperMu.RUnlock()
 		return []string{s.aggStreamMapper[parts[1]]}, nil
 	}
 
 	if hasEvent {
+		s.streamMapperMu.RLock()
+		defer s.streamMapperMu.RUnlock()
 		return s.evtStreamMapper[parts[4]], nil
 	}
 
 	return nil, fmt.Errorf("subject is not supported (%s)", subject)
+}
+
+func (s *Store) hasAggregateStreamMapping(aggregate string) bool {
+	s.streamMapperMu.RLock()
+	defer s.streamMapperMu.RUnlock()
+	_, ok := s.aggStreamMapper[aggregate]
+	return ok
+}
+
+func (s *Store) cacheAggregateStreamMapping(aggregate, stream string) {
+	s.streamMapperMu.Lock()
+	defer s.streamMapperMu.Unlock()
+	if _, ok := s.aggStreamMapper[aggregate]; !ok {
+		s.aggStreamMapper[aggregate] = stream
+	}
+}
+
+func (s *Store) hasEventStreamMapping(event string) bool {
+	s.streamMapperMu.RLock()
+	defer s.streamMapperMu.RUnlock()
+	_, ok := s.evtStreamMapper[event]
+	return ok
+}
+
+func (s *Store) cacheEventStreamMapping(event string, streamNames []string) {
+	s.streamMapperMu.Lock()
+	defer s.streamMapperMu.Unlock()
+	if _, ok := s.evtStreamMapper[event]; !ok {
+		s.evtStreamMapper[event] = streamNames
+	}
 }
 
 func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
@@ -141,7 +175,7 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 	evtNames := q.Names()
 
 	for _, a := range aggregateNames {
-		if _, ok := s.aggStreamMapper[a]; ok {
+		if s.hasAggregateStreamMapping(a) {
 			//already identified
 			continue
 		}
@@ -158,12 +192,12 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 		if len(names) == 0 {
 			return fmt.Errorf("no stream for aggregate (%s)", a)
 		}
-		s.aggStreamMapper[a] = names[0]
+		s.cacheAggregateStreamMapping(a, names[0])
 	}
 
 	for _, e := range evtNames {
 		normalisedEvt := normaliseEventName(e)
-		if _, ok := s.evtStreamMapper[normalisedEvt]; ok {
+		if s.hasEventStreamMapping(normalisedEvt) {
 			//already identified
 			continue
 		}
@@ -179,7 +213,7 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 		if len(names) == 0 {
 			return fmt.Errorf("no stream for event (%s)", e)
 		}
-		s.evtStreamMapper[normalisedEvt] = names
+		s.cacheEventStreamMapping(normalisedEvt, names)
 	}
 
 	return nil
@@ -323,12 +357,27 @@ func (s *Store) processQueryMsg(msg jetstream.Msg) (event.Event, error) {
 		return nil, err
 	}
 
-	if streams, ok := s.evtStreamMapper[metadata.normalisedEventName()]; !ok || (ok && len(streams) > 1) {
+	normalisedEvt := metadata.normalisedEventName()
+
+	needsStreamMetadata := func() bool {
+		s.streamMapperMu.RLock()
+		defer s.streamMapperMu.RUnlock()
+		streamNames, ok := s.evtStreamMapper[normalisedEvt]
+		return !ok || len(streamNames) > 1
+	}()
+
+	if needsStreamMetadata {
 		md, err := msg.Metadata()
 		if err != nil {
 			return nil, err
 		}
-		s.evtStreamMapper[metadata.normalisedEventName()] = []string{md.Stream}
+		func() {
+			s.streamMapperMu.Lock()
+			defer s.streamMapperMu.Unlock()
+			if streamNames, ok := s.evtStreamMapper[normalisedEvt]; !ok || len(streamNames) > 1 {
+				s.evtStreamMapper[normalisedEvt] = []string{md.Stream}
+			}
+		}()
 	}
 
 	data, err := s.enc.Unmarshal(msg.Data(), metadata.evtName)

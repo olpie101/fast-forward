@@ -51,11 +51,13 @@ func TestCheckServerVersion(t *testing.T) {
 }
 
 func TestValidateStore(t *testing.T) {
-	base := Store{
-		js:           stubJetStream{},
-		enc:          fakeEncoding{},
-		writeLeaseKV: &fakeKeyValuer[*kv.NilValue]{},
-		versionKV:    &fakeKeyValuer[*kv.UInt64Value]{},
+	newValidStore := func() *Store {
+		return &Store{
+			js:           stubJetStream{},
+			enc:          fakeEncoding{},
+			writeLeaseKV: &fakeKeyValuer[*kv.NilValue]{},
+			versionKV:    &fakeKeyValuer[*kv.UInt64Value]{},
+		}
 	}
 
 	tests := []struct {
@@ -72,11 +74,11 @@ func TestValidateStore(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := base
+			s := newValidStore()
 			if tt.mutate != nil {
-				tt.mutate(&s)
+				tt.mutate(s)
 			}
-			err := validateStore(&s)
+			err := validateStore(s)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validateStore() error = %v, want nil", err)

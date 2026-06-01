@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +31,7 @@ type Store struct {
 	js              jetstream.JetStream `options:"-"`
 	enc             codec.Encoding      `options:"-"`
 	logger          *zap.SugaredLogger
+	streamMapperMu  sync.RWMutex        `options:"-"`
 	aggStreamMapper map[string]string   `options:"-"`
 	evtStreamMapper map[string][]string `options:"-"`
 	retryCount      uint
