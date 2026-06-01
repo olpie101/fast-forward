@@ -29,16 +29,18 @@ var (
 )
 
 type Store struct {
-	js              jetstream.JetStream `options:"-"`
-	enc             codec.Encoding      `options:"-"`
-	logger          *zap.SugaredLogger
-	streamMapperMu  sync.RWMutex        `options:"-"`
-	aggStreamMapper map[string]string   `options:"-"`
-	evtStreamMapper map[string][]string `options:"-"`
-	retryCount      uint
-	pullExpiry      time.Duration
-	writeLeaseKV    kv.KeyValuer[*kv.NilValue]
-	versionKV       kv.KeyValuer[*kv.UInt64Value]
+	js                  jetstream.JetStream `options:"-"`
+	enc                 codec.Encoding      `options:"-"`
+	logger              *zap.SugaredLogger
+	streamMapperMu      sync.RWMutex        `options:"-"`
+	aggStreamMapper     map[string]string   `options:"-"`
+	evtStreamMapper     map[string][]string `options:"-"`
+	streamSubjectMu     sync.RWMutex        `options:"-"`
+	streamSubjectMapper map[string]string   `options:"-"`
+	retryCount          uint
+	pullExpiry          time.Duration
+	writeLeaseKV        kv.KeyValuer[*kv.NilValue]
+	versionKV           kv.KeyValuer[*kv.UInt64Value]
 }
 
 type versionInfo struct {
@@ -69,10 +71,11 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 	}
 
 	s := &Store{
-		js:              js,
-		enc:             enc,
-		aggStreamMapper: map[string]string{},
-		evtStreamMapper: map[string][]string{},
+		js:                  js,
+		enc:                 enc,
+		aggStreamMapper:     map[string]string{},
+		evtStreamMapper:     map[string][]string{},
+		streamSubjectMapper: map[string]string{},
 	}
 
 	err = applyStoreOptions(s, options...)

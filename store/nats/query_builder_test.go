@@ -138,13 +138,15 @@ func assertStringsEqual(t *testing.T, got, want []string) {
 }
 
 func TestOrderedConsumerConfig(t *testing.T) {
-	streamCfg := jetstream.StreamConfig{Subjects: []string{"es.order.>"}}
+	const streamSubject = "es.order.>"
+	const threshold = 30 * time.Second
 
 	t.Run("zero startTime leaves DeliverAll defaults", func(t *testing.T) {
 		cfg := orderedConsumerConfig(
 			[]string{"es.order." + uuid.New().String() + ".1.*"},
 			time.Time{},
-			streamCfg,
+			streamSubject,
+			threshold,
 		)
 		if cfg.DeliverPolicy != jetstream.DeliverAllPolicy {
 			t.Errorf("DeliverPolicy = %v, want DeliverAllPolicy (zero value)", cfg.DeliverPolicy)
@@ -155,6 +157,9 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		if len(cfg.FilterSubjects) != 1 {
 			t.Fatalf("len(FilterSubjects) = %d, want 1", len(cfg.FilterSubjects))
 		}
+		if cfg.InactiveThreshold != threshold {
+			t.Errorf("InactiveThreshold = %v, want %v", cfg.InactiveThreshold, threshold)
+		}
 	})
 
 	t.Run("non-zero startTime selects DeliverByStartTimePolicy", func(t *testing.T) {
@@ -162,7 +167,8 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		cfg := orderedConsumerConfig(
 			[]string{"es.order.*.*.*"},
 			start,
-			streamCfg,
+			streamSubject,
+			threshold,
 		)
 		if cfg.DeliverPolicy != jetstream.DeliverByStartTimePolicy {
 			t.Errorf("DeliverPolicy = %v, want DeliverByStartTimePolicy", cfg.DeliverPolicy)
@@ -172,6 +178,9 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		}
 		if !cfg.OptStartTime.Equal(start) {
 			t.Errorf("OptStartTime = %v, want %v", *cfg.OptStartTime, start)
+		}
+		if cfg.InactiveThreshold != threshold {
+			t.Errorf("InactiveThreshold = %v, want %v", cfg.InactiveThreshold, threshold)
 		}
 	})
 
@@ -184,9 +193,7 @@ func TestOrderedConsumerConfig(t *testing.T) {
 			"es.invoice." + id.String() + ".*.*",
 			"es.invoice." + id.String() + ".5.*",
 		}
-		cfg := orderedConsumerConfig(querySubjects, time.Time{}, jetstream.StreamConfig{
-			Subjects: []string{"es.order.>"},
-		})
+		cfg := orderedConsumerConfig(querySubjects, time.Time{}, "es.order.>", threshold)
 		want := []string{
 			"es.order." + id.String() + ".*.*",
 			"es.order." + id.String() + ".5.*",

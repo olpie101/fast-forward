@@ -53,6 +53,15 @@ type integrationHarness struct {
 	streamName string
 }
 
+// cachedStreamSubject returns the store's cached stream subject for this
+// harness's stream under the store's RWMutex, so white-box reads of
+// streamSubjectMapper stay synchronized with subscribe's writes.
+func (h *integrationHarness) cachedStreamSubject() string {
+	h.store.streamSubjectMu.RLock()
+	defer h.store.streamSubjectMu.RUnlock()
+	return h.store.streamSubjectMapper[h.streamName]
+}
+
 // newStore builds the per-test embedded harness for the given aggregate name.
 // Stream and KV buckets are created with unique names, and full teardown is
 // registered via t.Cleanup. The returned (*Store, jetstream.JetStream, *nats.Conn)

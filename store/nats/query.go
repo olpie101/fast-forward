@@ -415,21 +415,59 @@ func (s *Store) fetchVersionMinTime(ctx context.Context, stream, subject string,
 	return t, err
 }
 
+// streamSubject returns the stream's configured first subject, caching it so
+// subscribe avoids a per-query Stream() round trip. The cache value is static
+// for the stream lifetime, so concurrent misses both perform the lookup and
+// write the same constant (last-writer-wins); the JetStream call is made
+// outside any lock.
+func (s *Store) streamSubject(ctx context.Context, stream string) (string, error) {
+	var subject string
+	var ok bool
+	func() {
+		s.streamSubjectMu.RLock()
+		defer s.streamSubjectMu.RUnlock()
+		subject, ok = s.streamSubjectMapper[stream]
+	}()
+	if ok {
+		return subject, nil
+	}
+
+	str, err := s.js.Stream(ctx, stream)
+	if err != nil {
+		return "", fmt.Errorf("stream info (stream: %s): %w", stream, err)
+	}
+	info := str.CachedInfo()
+	if len(info.Config.Subjects) == 0 {
+		return "", fmt.Errorf("stream has no subjects (stream: %s)", stream)
+	}
+	subject = info.Config.Subjects[0]
+
+	func() {
+		s.streamSubjectMu.Lock()
+		defer s.streamSubjectMu.Unlock()
+		s.streamSubjectMapper[stream] = subject
+	}()
+
+	return subject, nil
+}
+
 func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
-	str, err := s.js.Stream(ctx, stream)
-
+	streamSubject, err := s.streamSubject(ctx, stream)
 	if err != nil {
 		errs <- err
 		return
 	}
 
-	i := str.CachedInfo()
-	conCfg := orderedConsumerConfig(subjects, startTime, i.Config)
+	threshold := max(orderedConsumerInactiveThreshold, 2*s.pullExpiry)
+	if deadline, ok := ctx.Deadline(); ok {
+		threshold = max(threshold, time.Until(deadline)+s.pullExpiry)
+	}
 
-	c, err := str.OrderedConsumer(ctx, conCfg)
+	conCfg := orderedConsumerConfig(subjects, startTime, streamSubject, threshold)
 
+	c, err := s.js.OrderedConsumer(ctx, stream, conCfg)
 	if err != nil {
 		errs <- fmt.Errorf("create consumer error (stream: %s): %w", stream, err)
 		return
@@ -450,14 +488,23 @@ func normaliseSubject(streamSubject, subject string) string {
 	return strings.Join(subParts, ".")
 }
 
-func orderedConsumerConfig(subjects []string, startTime time.Time, sc jetstream.StreamConfig) jetstream.OrderedConsumerConfig {
+// orderedConsumerInactiveThreshold is the floor for a per-query ordered
+// consumer's InactiveThreshold. nats.go's orderedSubscription.Stop only stops
+// the current subscription and does not delete the final consumer (it deletes
+// previous consumers only on reset), so InactiveThreshold is the primary
+// server-side cleanup lever for the consumer left behind after consumeMessages
+// defers it.Stop.
+const orderedConsumerInactiveThreshold = 5 * time.Second
+
+func orderedConsumerConfig(subjects []string, startTime time.Time, streamSubject string, inactiveThreshold time.Duration) jetstream.OrderedConsumerConfig {
 	filterSubjects := make([]string, 0, len(subjects))
 	for _, s := range subjects {
-		filterSubjects = append(filterSubjects, normaliseSubject(sc.Subjects[0], s))
+		filterSubjects = append(filterSubjects, normaliseSubject(streamSubject, s))
 	}
 
 	cfg := jetstream.OrderedConsumerConfig{
-		FilterSubjects: filterSubjects,
+		FilterSubjects:    filterSubjects,
+		InactiveThreshold: inactiveThreshold,
 	}
 
 	if !startTime.IsZero() {
@@ -477,6 +524,8 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error, ex
 	if err != nil {
 		return err
 	}
+	// it.Stop only stops the current subscription; the final ordered consumer is
+	// reaped server-side via its InactiveThreshold, not by this Stop.
 	defer it.Stop()
 
 	var count uint64 = 0

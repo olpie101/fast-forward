@@ -237,9 +237,10 @@ func TestQueryIntegration(t *testing.T) {
 
 	t.Run("time_min", func(t *testing.T) {
 		// Exercises subscribe's DeliverByStartTimePolicy path. Replaces the old
-		// consumer-introspection assertion that walked Stream.ListConsumers —
-		// ordered consumers are torn down server-side when the iterator stops,
-		// so the consumer is gone by the time the test inspects.
+		// consumer-introspection assertion that walked Stream.ListConsumers.
+		// nats.go's iterator Stop does not immediately delete the final ordered
+		// consumer; server-side cleanup relies on the consumer's
+		// InactiveThreshold, so introspecting consumer lists here is racy.
 		//
 		// Note: the final {3,4} assertion is also enforced by limitGuard
 		// (query_limit_guard.go:57-64 filters by header time post-collect), so
