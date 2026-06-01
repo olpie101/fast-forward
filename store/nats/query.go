@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,14 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	} else {
 		subCtx, cancel = context.WithCancel(ctx)
 	}
-	defer cancel()
+	// The streaming fast path transfers cancel ownership to its coordinator
+	// goroutine, so only cancel here when we keep the materialized path.
+	streaming := false
+	defer func() {
+		if !streaming {
+			cancel()
+		}
+	}()
 	start := time.Now()
 
 	err := s.identifyStreams(ctx, q)
@@ -37,30 +45,23 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	groups := make(map[string][]string)
 	for _, subject := range subjects {
-		streams, err := s.streamFunc(subject)
+		streamNames, err := s.streamFunc(subject)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		for _, name := range streams {
+		for _, name := range streamNames {
 			groups[name] = append(groups[name], subject)
 		}
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(len(groups))
-
-	cmsgs := make(chan jetstream.Msg, 200)
-	push := streams.ConcurrentContext(subCtx, cmsgs)
-	subErrs := make(chan error, 1)
 	minTime := q.Times().Min()
-
 	if len(subjects) == 1 && len(q.AggregateIDs()) == 1 && guard.hasMinVersion && guard.minVersion > 1 {
 		st := time.Now()
-		for stream, subjects := range groups {
-			t, err := s.fetchVersionMinTime(ctx, stream, subjects[0], guard.minVersion-1)
+		for stream, gsubjects := range groups {
+			t, err := s.fetchVersionMinTime(ctx, stream, gsubjects[0], guard.minVersion-1)
 			if err != nil {
-				s.logger.Errorw("unable to get aggregate min time", "subject", subjects[0], "error", err)
+				s.logger.Errorw("unable to get aggregate min time", "subject", gsubjects[0], "error", err)
 				break
 			}
 			minTime = t
@@ -68,15 +69,19 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		s.logger.Infow("aggreagte fetch version metadata", "d", time.Since(st))
 	}
 
-	for stream, subjects := range groups {
-		go s.subscribe(subCtx, &wg, stream, subjects, minTime, push, subErrs)
+	// SortAggregateVersion/Asc fast path relies on Store.Insert preserving and
+	// appending single-aggregate events in aggregate-version order (enforced by
+	// validateBatchVersionContiguity before lease acquisition), so an ordered
+	// consumer delivers them already sorted and no full materialize +
+	// event.SortMulti is required.
+	if canStreamReplay(q, subjects, groups) {
+		cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, minTime)
+		out, errs := s.streamReplay(subCtx, cancel, groups, minTime, guard, cmsgs, subErrs)
+		streaming = true
+		return out, errs, nil
 	}
 
-	go func() {
-		wg.Wait()
-		close(cmsgs)
-		close(subErrs)
-	}()
+	cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, minTime)
 
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
@@ -114,6 +119,168 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	s.logger.Debugw("total evts c", "total", len(evts), "duration", time.Since(start))
 	return streams.New(evts), opErrs, nil
+}
+
+// spawnSubscriptions starts one subscribe goroutine per stream group and a
+// waiter that closes both returned channels once every subscriber has
+// finished. It is shared by the materialized and streaming query paths and may
+// be called again by the streaming coordinator to re-establish a subscription
+// on a retryable error.
+func (s *Store) spawnSubscriptions(subCtx context.Context, groups map[string][]string, minTime time.Time) (<-chan jetstream.Msg, <-chan error) {
+	var wg sync.WaitGroup
+	wg.Add(len(groups))
+
+	cmsgs := make(chan jetstream.Msg, 200)
+	push := streams.ConcurrentContext(subCtx, cmsgs)
+	subErrs := make(chan error, 1)
+
+	for stream, subjects := range groups {
+		go s.subscribe(subCtx, &wg, stream, subjects, minTime, push, subErrs)
+	}
+
+	go func() {
+		wg.Wait()
+		close(cmsgs)
+		close(subErrs)
+	}()
+
+	return cmsgs, subErrs
+}
+
+// canStreamReplay reports whether a query is eligible for the streaming
+// fast path: it must resolve to a single stream, target exactly one concrete
+// (aggregateName, aggregateID) pair across all built subjects, and request
+// exactly one explicit ascending SortAggregateVersion ordering.
+func canStreamReplay(q event.Query, subjects []string, groups map[string][]string) bool {
+	if len(groups) != 1 || len(subjects) == 0 {
+		return false
+	}
+	if !isSingleAggregateVersionAscSort(q) {
+		return false
+	}
+
+	var name, id string
+	for i, subject := range subjects {
+		parts := strings.Split(subject, ".")
+		if len(parts) != 5 || parts[0] != "es" {
+			return false
+		}
+		if parts[1] == "*" || parts[2] == "*" {
+			return false
+		}
+		if i == 0 {
+			name, id = parts[1], parts[2]
+			continue
+		}
+		if parts[1] != name || parts[2] != id {
+			return false
+		}
+	}
+	return true
+}
+
+func isSingleAggregateVersionAscSort(q event.Query) bool {
+	sortings := q.Sortings()
+	return len(sortings) == 1 &&
+		sortings[0].Sort == event.SortAggregateVersion &&
+		sortings[0].Dir == event.SortAsc
+}
+
+// streamReplay owns the returned out/errs channels and the subCtx cancel for
+// the streaming fast path. A single coordinator goroutine is the sole sender to
+// errs and the sole closer of both channels.
+func (s *Store) streamReplay(
+	subCtx context.Context,
+	cancel context.CancelFunc,
+	groups map[string][]string,
+	minTime time.Time,
+	guard limitGuard,
+	cmsgs <-chan jetstream.Msg,
+	subErrs <-chan error,
+) (<-chan event.Event, <-chan error) {
+	out := make(chan event.Event)
+	errs := make(chan error, 1)
+
+	go func() {
+		defer cancel()
+		defer close(errs)
+		defer close(out)
+
+		// Mirror Store.Query's retry budget (store.go:158-173). Retry is only
+		// safe before the first event is emitted: an ordered-consumer restart
+		// re-delivers from the start and would double-emit already-sent events.
+		// The materialized fallback never emits before completing, so pre-emit
+		// retry preserves equivalent ErrNoHeartbeat recovery without that hazard.
+		emitted := false
+		for i := 0; ; i++ {
+			termErr := s.streamSubscription(subCtx, cmsgs, subErrs, guard, out, errs, &emitted)
+			if termErr == nil {
+				return
+			}
+			if errors.Is(termErr, jetstream.ErrNoHeartbeat) && !emitted && i < int(s.retryCount)-1 {
+				s.logger.Errorw("stream replay retrying", "count", i+1, "err", termErr)
+				backoff := time.Duration(2 * math.Pow(2, float64(i)))
+				select {
+				case <-subCtx.Done():
+					return
+				case <-time.After(backoff * time.Second):
+				}
+				cmsgs, subErrs = s.spawnSubscriptions(subCtx, groups, minTime)
+				continue
+			}
+			sendStreamErr(subCtx, errs, termErr)
+			return
+		}
+	}()
+
+	return out, errs
+}
+
+// streamSubscription drains one subscription, emitting guard-passing events to
+// out and forwarding decode/metadata errors to errs. It returns the terminal
+// error for the pass: the subscription error (nil if the subscription finished
+// cleanly) or a context error if subCtx was cancelled mid-send.
+func (s *Store) streamSubscription(
+	subCtx context.Context,
+	cmsgs <-chan jetstream.Msg,
+	subErrs <-chan error,
+	guard limitGuard,
+	out chan<- event.Event,
+	errs chan<- error,
+	emitted *bool,
+) error {
+	for m := range cmsgs {
+		e, err := s.processQueryMsg(m)
+		if err != nil {
+			if !sendStreamErr(subCtx, errs, err) {
+				return subCtx.Err()
+			}
+			continue
+		}
+		if e == nil || !guard.guard(e) {
+			continue
+		}
+		select {
+		case out <- e:
+			*emitted = true
+		case <-subCtx.Done():
+			return subCtx.Err()
+		}
+	}
+
+	return <-subErrs
+}
+
+// sendStreamErr sends err to errs unless subCtx is cancelled first, returning
+// whether the send succeeded. It keeps every error send context-aware so the
+// coordinator never blocks once the caller cancels.
+func sendStreamErr(subCtx context.Context, errs chan<- error, err error) bool {
+	select {
+	case errs <- err:
+		return true
+	case <-subCtx.Done():
+		return false
+	}
 }
 
 func (s *Store) streamFunc(subject string) ([]string, error) {

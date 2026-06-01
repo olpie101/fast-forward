@@ -23,8 +23,9 @@ import (
 
 // Error
 var (
-	ErrLeaseLocked               = errors.New("lease is currently locked")
-	ErrValidationVersionMismatch = errors.New("validation version mismatch")
+	ErrLeaseLocked                   = errors.New("lease is currently locked")
+	ErrValidationVersionMismatch     = errors.New("validation version mismatch")
+	ErrNonContiguousAggregateVersion = errors.New("non-contiguous aggregate version batch")
 )
 
 type Store struct {
@@ -89,6 +90,12 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 
 // Insert inserts events into the store.
 func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
+	// Validate within-batch aggregate-version contiguity before acquiring any
+	// lease or version state, so a rejected batch leaves no side effects.
+	if err := validateBatchVersionContiguity(evts); err != nil {
+		return err
+	}
+
 	leases, err := s.obtainLeases(ctx, evts)
 	if err != nil {
 		return err
@@ -213,6 +220,27 @@ func checkServerVersion(version string) error {
 		return fmt.Errorf("%w: %q: requires >= 2.10", ErrUnsupportedServerVersion, version)
 	}
 
+	return nil
+}
+
+// validateBatchVersionContiguity enforces that, within a single Insert batch,
+// each aggregate's events are contiguous and strictly ascending by version. It
+// tracks the last-seen version per aggregate within THIS batch only; the
+// SortAggregateVersion/Asc query fast path relies on same-aggregate events being
+// published in contiguous, ascending order. Cross-call monotonicity is enforced
+// separately by the lease/version path in genPublishMsgs. Interleaved
+// multi-aggregate batches (e.g. A1,B1,A2,B2) remain valid. It is pure (no I/O,
+// no state mutation) so callers can reject a batch before any side effect.
+func validateBatchVersionContiguity(evts []event.Event) error {
+	batchVersions := make(map[string]int, len(evts))
+	for _, evt := range evts {
+		u, name, version := evt.Aggregate()
+		lKey := writeLeaseKey(name, u)
+		if prev, seen := batchVersions[lKey]; seen && version != prev+1 {
+			return fmt.Errorf("%w: aggregate %q expected version %d, got %d", ErrNonContiguousAggregateVersion, lKey, prev+1, version)
+		}
+		batchVersions[lKey] = version
+	}
 	return nil
 }
 

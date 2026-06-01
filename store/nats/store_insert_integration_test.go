@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -237,4 +238,121 @@ func TestInsertIntegration(t *testing.T) {
 			t.Fatalf("writeLeaseKV keys = %v, want none", keys)
 		}
 	})
+}
+
+// TestInsertBatchVersionContiguity pins the write-path invariant the
+// SortAggregateVersion/Asc query fast path relies on: a single Insert batch for
+// one aggregate must carry contiguous, ascending versions. Validation is
+// within-batch only — sequential single-event inserts across separate calls and
+// interleaved multi-aggregate batches stay valid.
+func TestInsertBatchVersionContiguity(t *testing.T) {
+	const eventName = "order.created"
+
+	t.Run("out_of_order_batch_rejected", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		key := "order." + aggID.String()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := h.store.Insert(ctx,
+			newOrderEvent(t, aggID, eventName, 1),
+			newOrderEvent(t, aggID, eventName, 3),
+			newOrderEvent(t, aggID, eventName, 2),
+		)
+		if !errors.Is(err, ErrNonContiguousAggregateVersion) {
+			t.Fatalf("Insert(v1,v3,v2) err = %v, want ErrNonContiguousAggregateVersion", err)
+		}
+		// Rejection must occur before any lease/version side effect.
+		assertNoWriteState(t, h, key)
+	})
+
+	t.Run("duplicate_version_batch_rejected", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		key := "order." + aggID.String()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := h.store.Insert(ctx,
+			newOrderEvent(t, aggID, eventName, 1),
+			newOrderEvent(t, aggID, eventName, 1),
+		)
+		if !errors.Is(err, ErrNonContiguousAggregateVersion) {
+			t.Fatalf("Insert(v1,v1) err = %v, want ErrNonContiguousAggregateVersion", err)
+		}
+		assertNoWriteState(t, h, key)
+	})
+
+	t.Run("interleaved_aggregates_accepted", func(t *testing.T) {
+		// Per-aggregate contiguity holds (aggA: 1,2; aggB: 1,2) even though the
+		// batch is not globally monotonic. Within-batch validation must allow it.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggA, aggB := uuid.New(), uuid.New()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := h.store.Insert(ctx,
+			newOrderEvent(t, aggA, eventName, 1),
+			newOrderEvent(t, aggB, eventName, 1),
+			newOrderEvent(t, aggA, eventName, 2),
+			newOrderEvent(t, aggB, eventName, 2),
+		)
+		if err != nil {
+			t.Fatalf("Insert(interleaved A1,B1,A2,B2) err = %v, want nil", err)
+		}
+	})
+
+	t.Run("ordered_batch_stream_sequence_matches_version", func(t *testing.T) {
+		// Positive invariant: a single multi-event in-order batch publishes so
+		// that stream sequence order matches aggregate-version order. Uses one
+		// Insert(ctx, evts...) call (not repeated single inserts) because the
+		// risk is caller-supplied slice order at store.go:108-123.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.store.Insert(ctx,
+			newOrderEvent(t, aggID, eventName, 1),
+			newOrderEvent(t, aggID, eventName, 2),
+			newOrderEvent(t, aggID, eventName, 3),
+		); err != nil {
+			t.Fatalf("Insert(v1,v2,v3): %v", err)
+		}
+
+		str, err := h.js.Stream(ctx, h.streamName)
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		for seq := uint64(1); seq <= 3; seq++ {
+			raw, err := str.GetMsg(ctx, seq)
+			if err != nil {
+				t.Fatalf("GetMsg(seq=%d): %v", seq, err)
+			}
+			got := raw.Header.Get(MetadataKeyEventAggregateVersion)
+			want := fmt.Sprintf("%d", seq)
+			if got != want {
+				t.Fatalf("stream seq %d has aggregate-version %q, want %q", seq, got, want)
+			}
+		}
+	})
+}
+
+// assertNoWriteState verifies that neither the version KV nor the write-lease KV
+// holds any entry for key — i.e. a rejected Insert left no side effect.
+func assertNoWriteState(t *testing.T, h *integrationHarness, key string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := h.store.versionKV.Get(ctx, key); !errors.Is(err, nats.ErrKeyNotFound) {
+		t.Errorf("versionKV.Get(%s) err = %v, want ErrKeyNotFound (no side effect on rejected batch)", key, err)
+	}
+	if _, _, err := h.store.writeLeaseKV.Get(ctx, key); !errors.Is(err, nats.ErrKeyNotFound) {
+		t.Errorf("writeLeaseKV.Get(%s) err = %v, want ErrKeyNotFound (no side effect on rejected batch)", key, err)
+	}
 }

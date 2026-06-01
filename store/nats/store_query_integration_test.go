@@ -12,6 +12,8 @@ import (
 	"github.com/modernice/goes/event/query"
 	qtime "github.com/modernice/goes/event/query/time"
 	"github.com/modernice/goes/event/query/version"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // insertEventsAt seeds the harness's stream with the given events, calling
@@ -398,4 +400,237 @@ func TestQueryIntegrationMalformedSubjectPanic_Skip(t *testing.T) {
 
 func TestQuerySyncCollectTODO_Skip(t *testing.T) {
 	t.Skip("store/nats/query.go:84 collect is sync — query() blocks on collect before returning channels; desired: collect concurrently so caller can stream events while consumer is still draining. Characterize by inserting a large batch and asserting first event arrives on evts before collect fully completes.")
+}
+
+// TestQueryStreamingFastPath covers the SortAggregateVersion/Asc streaming fast
+// path and the fallback shapes that must NOT take it. Ordering correctness is
+// the testable contract; lower latency is not asserted (see plan). Predicate
+// boundaries are pinned separately by TestCanStreamReplay.
+func TestQueryStreamingFastPath(t *testing.T) {
+	const eventName = "order.created"
+
+	t.Run("fast_path_streams_in_version_order", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		// Insert in version order but with DESCENDING event times. This pins the
+		// ordering CONTRACT for the fast-path-eligible shape: the result is
+		// version-ascending and NOT default time order. (It does not by itself
+		// prove the streaming branch was taken — fallback with an explicit
+		// version sort would also yield version order; branch eligibility is
+		// pinned by TestCanStreamReplay.)
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base.Add(2*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 2, base.Add(1*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 3, base),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.SortBy(event.SortAggregateVersion, event.SortAsc),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want 3", len(got))
+		}
+		for i, e := range got {
+			if _, _, v := e.Aggregate(); v != i+1 {
+				t.Fatalf("got[%d] version = %d, want %d (version-ascending stream order)", i, v, i+1)
+			}
+		}
+	})
+
+	t.Run("fast_path_with_version_min_applies_guard", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base),
+			mkEvent(t, eventName, aggID, 2, base.Add(1*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 3, base.Add(2*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 4, base.Add(3*time.Millisecond)),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.AggregateVersion(version.Min(3)),
+			query.SortBy(event.SortAggregateVersion, event.SortAsc),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 2 {
+			t.Fatalf("len(got) = %d, want 2", len(got))
+		}
+		for i, e := range got {
+			if _, _, v := e.Aggregate(); v != i+3 {
+				t.Fatalf("got[%d] version = %d, want %d", i, v, i+3)
+			}
+		}
+	})
+
+	t.Run("fallback_aggregate_id_and_event_name_no_name", func(t *testing.T) {
+		// Subject is es.*.<id>.*.<evt> (wildcard aggregate name) → predicate
+		// false → fallback. Result correctness must be preserved.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 1, base))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateID(aggID),
+			query.Name(eventName),
+			query.SortBy(event.SortAggregateVersion, event.SortAsc),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 1 {
+			t.Fatalf("len(got) = %d, want 1", len(got))
+		}
+	})
+
+	t.Run("fallback_no_sort_uses_time_order", func(t *testing.T) {
+		// Single concrete aggregate, no explicit sort, with non-monotonic event
+		// times → fallback default SortTime ascending, not version/stream order.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base.Add(2*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 2, base),
+			mkEvent(t, eventName, aggID, 3, base.Add(1*time.Millisecond)),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want 3", len(got))
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].Time().Before(got[i-1].Time()) {
+				t.Fatalf("fallback not time-ascending: %v then %v", got[i-1].Time(), got[i].Time())
+			}
+		}
+	})
+
+	t.Run("fallback_explicit_sort_time", func(t *testing.T) {
+		// Explicit SortTime/Asc → predicate false → fallback time-ascending.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base.Add(2*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 2, base),
+			mkEvent(t, eventName, aggID, 3, base.Add(1*time.Millisecond)),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.SortBy(event.SortTime, event.SortAsc),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want 3", len(got))
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].Time().Before(got[i-1].Time()) {
+				t.Fatalf("fallback not time-ascending: %v then %v", got[i-1].Time(), got[i].Time())
+			}
+		}
+	})
+
+	t.Run("fast_path_async_decode_error_delivered", func(t *testing.T) {
+		// Publish a raw message with valid metadata headers but undecodable
+		// data to the concrete aggregate subject, then run a fast-path query.
+		// processQueryMsg fails on Unmarshal and the error must arrive on the
+		// returned error channel (not the synchronous third return value).
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		subject := fmt.Sprintf("es.order.%s.1.%s", aggID, normaliseEventName(eventName))
+		header := make(nats.Header)
+		header.Set(MetadataKeyEventName, eventName)
+		header.Set(MetadataKeyEventTime, time.Now().UTC().Format(time.RFC3339Nano))
+		header.Set(jetstream.MsgIDHeader, uuid.New().String())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := h.js.PublishMsg(ctx, &nats.Msg{
+			Subject: subject,
+			Header:  header,
+			Data:    []byte("{not valid json for a string}"),
+		}); err != nil {
+			t.Fatalf("PublishMsg: %v", err)
+		}
+
+		evts, errs, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.SortBy(event.SortAggregateVersion, event.SortAsc),
+		))
+		if err != nil {
+			t.Fatalf("Query returned synchronous error: %v", err)
+		}
+		got, gotErrs := drainQuery(t, evts, errs, 5*time.Second)
+		if len(got) != 0 {
+			t.Fatalf("len(got) = %d, want 0 (message is undecodable)", len(got))
+		}
+		if len(gotErrs) == 0 {
+			t.Fatal("expected at least one async decode error, got none")
+		}
+	})
 }
