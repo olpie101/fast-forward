@@ -93,6 +93,18 @@ func subjectToValues(sub string) (aggregateName string, id uuid.UUID, version in
 	return parts[0], id, version, nil
 }
 
+// rawStreamMsgValues extracts the aggregate version (from the subject's version
+// token) and the stream sequence from a raw stream message. The version is
+// parsed via subjectToValues; the sequence is taken directly from the message
+// metadata.
+func rawStreamMsgValues(msg *jetstream.RawStreamMsg) (version int, sequence uint64, err error) {
+	_, _, version, err = subjectToValues(msg.Subject)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parsing raw stream msg subject: %w", err)
+	}
+	return version, msg.Sequence, nil
+}
+
 func genNatsHeader(evt event.Event) nats.Header {
 	header := make(nats.Header)
 	header.Set(MetadataKeyEventName, evt.Name())

@@ -262,25 +262,74 @@ func TestGetOrCreateCurrentVersionFound(t *testing.T) {
 	}
 }
 
-func TestGetOrCreateCurrentVersionNotFoundCreatesZero(t *testing.T) {
-	versionKV := &fakeKeyValuer[*kv.UInt64Value]{
-		getErr:    nats.ErrKeyNotFound,
-		createRev: 55,
-	}
-	s := Store{versionKV: versionKV}
+// TestGetOrCreateCurrentVersionNotFoundSeedsZeroWhenNoEvents exercises the
+// cold-key reconciliation path when the stream has NO events for the aggregate:
+// GetLastMsgForSubject returns ErrMsgNotFound, so the version reconciles to 0
+// and versionKV is seeded with 0 (preserving the prior seed-0 behavior). A real
+// js is required because the not-found branch now resolves the stream and reads
+// its last message.
+func TestGetOrCreateCurrentVersionNotFoundSeedsZeroWhenNoEvents(t *testing.T) {
+	h := newHarness(t, "order")
+	aggID := uuid.New()
+	key := "order." + aggID.String()
 
-	value, rev, err := s.getOrCreateCurrentVersion(context.Background(), "order.1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	value, _, err := h.store.getOrCreateCurrentVersion(ctx, key)
 	if err != nil {
 		t.Fatalf("getOrCreateCurrentVersion() error = %v", err)
 	}
-	if value != 0 || rev != 55 {
-		t.Fatalf("value, rev = %d, %d; want 0, 55", value, rev)
+	if value != 0 {
+		t.Fatalf("value = %d, want 0 (stream has no events for the aggregate)", value)
 	}
-	if len(versionKV.creates) != 1 {
-		t.Fatalf("len(creates) = %d, want 1", len(versionKV.creates))
+	got, _, err := h.store.versionKV.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("versionKV.Get: %v", err)
 	}
-	if create := versionKV.creates[0]; create.key != "order.1" || create.value.Value != 0 {
-		t.Fatalf("create = %#v, want key order.1 value 0", create)
+	if got.Value != 0 {
+		t.Fatalf("seeded versionKV = %d, want 0", got.Value)
+	}
+}
+
+// TestGetOrCreateCurrentVersionReconcilesFromStream covers the cold-key
+// reconciliation: after inserting v1..3 the versionKV key is wiped while the
+// stream still holds the events; a fresh getOrCreateCurrentVersion must derive
+// version 3 from the stream's last message and re-seed versionKV with it.
+func TestGetOrCreateCurrentVersionReconcilesFromStream(t *testing.T) {
+	const eventName = "order.created"
+	h := newHarness(t, "order")
+	h.registerString(eventName)
+
+	aggID := uuid.New()
+	key := "order." + aggID.String()
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	insertEventsAt(t, h,
+		mkEvent(t, eventName, aggID, 1, base),
+		mkEvent(t, eventName, aggID, 2, base.Add(time.Millisecond)),
+		mkEvent(t, eventName, aggID, 3, base.Add(2*time.Millisecond)),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := h.store.versionKV.Delete(ctx, key); err != nil {
+		t.Fatalf("wipe versionKV: %v", err)
+	}
+
+	value, _, err := h.store.getOrCreateCurrentVersion(ctx, key)
+	if err != nil {
+		t.Fatalf("getOrCreateCurrentVersion() error = %v", err)
+	}
+	if value != 3 {
+		t.Fatalf("reconciled version = %d, want 3", value)
+	}
+	got, _, err := h.store.versionKV.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("versionKV.Get: %v", err)
+	}
+	if got.Value != 3 {
+		t.Fatalf("seeded versionKV = %d, want 3", got.Value)
 	}
 }
 
@@ -294,11 +343,18 @@ func TestGetOrCreateCurrentVersionGetError(t *testing.T) {
 	}
 }
 
+// TestGetOrCreateCurrentVersionCreateError uses a real js for reconciliation
+// (empty stream → reconciles to 0) but swaps in a fake versionKV whose Create
+// fails, asserting the Create error propagates from the not-found branch.
 func TestGetOrCreateCurrentVersionCreateError(t *testing.T) {
+	h := newHarness(t, "order")
 	createErr := errors.New("create failed")
-	s := Store{versionKV: &fakeKeyValuer[*kv.UInt64Value]{getErr: nats.ErrKeyNotFound, createErr: createErr}}
+	h.store.versionKV = &fakeKeyValuer[*kv.UInt64Value]{getErr: nats.ErrKeyNotFound, createErr: createErr}
 
-	_, _, err := s.getOrCreateCurrentVersion(context.Background(), "order.1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	aggID := uuid.New()
+	_, _, err := h.store.getOrCreateCurrentVersion(ctx, "order."+aggID.String())
 	if !errors.Is(err, createErr) {
 		t.Fatalf("getOrCreateCurrentVersion() error = %v, want %v", err, createErr)
 	}

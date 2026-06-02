@@ -55,16 +55,23 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		}
 	}
 
-	minTime := q.Times().Min()
+	anchor := readAnchor{startTime: q.Times().Min()}
 	if len(subjects) == 1 && len(q.AggregateIDs()) == 1 && guard.hasMinVersion && guard.minVersion > 1 {
 		st := time.Now()
 		for stream, gsubjects := range groups {
-			t, err := s.fetchVersionMinTime(ctx, stream, gsubjects[0], guard.minVersion-1)
+			seq, err := s.fetchVersionAnchorSeq(ctx, stream, gsubjects[0], guard.minVersion-1)
 			if err != nil {
-				s.logger.Errorw("unable to get aggregate min time", "subject", gsubjects[0], "error", err)
+				// Non-fatal: the anchor is an optimization. ErrMsgNotFound
+				// (the N-1 event is absent) is expected and silent; any other
+				// error is logged via the existing zap logger. In both cases we
+				// keep the q.Times().Min() time anchor (or a zero anchor) so a
+				// previously-successful query never starts hard-failing here.
+				if !errors.Is(err, jetstream.ErrMsgNotFound) {
+					s.logger.Errorw("unable to get aggregate min time", "subject", gsubjects[0], "error", err)
+				}
 				break
 			}
-			minTime = t
+			anchor = readAnchor{startSeq: seq}
 		}
 		s.logger.Infow("aggreagte fetch version metadata", "d", time.Since(st))
 	}
@@ -75,13 +82,13 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 	// consumer delivers them already sorted and no full materialize +
 	// event.SortMulti is required.
 	if canStreamReplay(q, subjects, groups) {
-		cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, minTime)
-		out, errs := s.streamReplay(subCtx, cancel, groups, minTime, guard, cmsgs, subErrs)
+		cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, anchor)
+		out, errs := s.streamReplay(subCtx, cancel, groups, anchor, guard, cmsgs, subErrs)
 		streaming = true
 		return out, errs, nil
 	}
 
-	cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, minTime)
+	cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, anchor)
 
 	opErrs := make(chan error, 1)
 	defer close(opErrs)
@@ -126,7 +133,7 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 // finished. It is shared by the materialized and streaming query paths and may
 // be called again by the streaming coordinator to re-establish a subscription
 // on a retryable error.
-func (s *Store) spawnSubscriptions(subCtx context.Context, groups map[string][]string, minTime time.Time) (<-chan jetstream.Msg, <-chan error) {
+func (s *Store) spawnSubscriptions(subCtx context.Context, groups map[string][]string, anchor readAnchor) (<-chan jetstream.Msg, <-chan error) {
 	var wg sync.WaitGroup
 	wg.Add(len(groups))
 
@@ -135,7 +142,7 @@ func (s *Store) spawnSubscriptions(subCtx context.Context, groups map[string][]s
 	subErrs := make(chan error, 1)
 
 	for stream, subjects := range groups {
-		go s.subscribe(subCtx, &wg, stream, subjects, minTime, push, subErrs)
+		go s.subscribe(subCtx, &wg, stream, subjects, anchor, push, subErrs)
 	}
 
 	go func() {
@@ -193,7 +200,7 @@ func (s *Store) streamReplay(
 	subCtx context.Context,
 	cancel context.CancelFunc,
 	groups map[string][]string,
-	minTime time.Time,
+	anchor readAnchor,
 	guard limitGuard,
 	cmsgs <-chan jetstream.Msg,
 	subErrs <-chan error,
@@ -225,7 +232,7 @@ func (s *Store) streamReplay(
 					return
 				case <-time.After(backoff * time.Second):
 				}
-				cmsgs, subErrs = s.spawnSubscriptions(subCtx, groups, minTime)
+				cmsgs, subErrs = s.spawnSubscriptions(subCtx, groups, anchor)
 				continue
 			}
 			sendStreamErr(subCtx, errs, termErr)
@@ -346,20 +353,9 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 			//already identified
 			continue
 		}
-
-		subject := fmt.Sprintf("es.%s.*.*.*", a)
-		snl := s.js.StreamNames(ctx, jetstream.WithStreamListSubject(subject))
-		if snl.Err() != nil {
-			return snl.Err()
-		}
-		names, err := streams.Drain(ctx, snl.Name())
-		if snl.Err() != nil {
+		if _, err := s.streamNameForAggregate(ctx, a); err != nil {
 			return err
 		}
-		if len(names) == 0 {
-			return fmt.Errorf("no stream for aggregate (%s)", a)
-		}
-		s.cacheAggregateStreamMapping(a, names[0])
 	}
 
 	for _, e := range evtNames {
@@ -386,33 +382,72 @@ func (s *Store) identifyStreams(ctx context.Context, q event.Query) error {
 	return nil
 }
 
-func (s *Store) fetchVersionMinTime(ctx context.Context, stream, subject string, version int) (time.Time, error) {
+// streamNameForAggregate resolves the JetStream stream that stores events for
+// the given aggregate name. It uses the cached stream mapping when present and
+// otherwise performs a StreamNames discovery (caching the result), mirroring
+// identifyStreams. The write-path version reconciliation relies on this because
+// the stream-mapper cache is populated by reads and may be cold on a write.
+func (s *Store) streamNameForAggregate(ctx context.Context, name string) (string, error) {
+	if s.hasAggregateStreamMapping(name) {
+		streamNames, err := s.streamFunc(fmt.Sprintf("es.%s.*.*.*", name))
+		if err != nil {
+			return "", err
+		}
+		if len(streamNames) > 0 && streamNames[0] != "" {
+			return streamNames[0], nil
+		}
+	}
+
+	subject := fmt.Sprintf("es.%s.*.*.*", name)
+	snl := s.js.StreamNames(ctx, jetstream.WithStreamListSubject(subject))
+	if snl.Err() != nil {
+		return "", snl.Err()
+	}
+	names, err := streams.Drain(ctx, snl.Name())
+	if err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no stream for aggregate (%s)", name)
+	}
+	s.cacheAggregateStreamMapping(name, names[0])
+	return names[0], nil
+}
+
+// fetchVersionAnchorSeq returns the stream sequence of the single event at the
+// given aggregate version, used to anchor a read exactly at that point via
+// OptStartSeq. The anchor subject is built EXPLICITLY from the aggregate
+// name/id (subject parts) with a literal version token and a wildcard event
+// token (es.<name>.<id>.<version>.*), so the version is always the replaced
+// token — never the first wildcard encountered. It returns
+// jetstream.ErrMsgNotFound when no such event exists, letting the caller fall
+// back to a time anchor or an unanchored read.
+func (s *Store) fetchVersionAnchorSeq(ctx context.Context, stream, subject string, version int) (uint64, error) {
 	parts := strings.Split(subject, ".")
-	if len(parts) != 5 && parts[3] != "*" {
-		return time.Time{}, errors.New("unknown subject format to identify version")
+	if len(parts) != 5 || parts[3] != "*" {
+		return 0, errors.New("unknown subject format to identify version")
 	}
 
-	subject = strings.Replace(subject, "*", fmt.Sprintf("%d", version), 1)
-	s.logger.Debugw("fetching aggregate version meta", "subject", subject)
-	c, err := s.js.CreateOrUpdateConsumer(ctx, stream, jetstream.ConsumerConfig{
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckPolicy:     jetstream.AckNonePolicy,
-		FilterSubject: subject,
-		HeadersOnly:   true,
-		Replicas:      1,
-		MemoryStorage: true,
-	})
+	anchorSubject := fmt.Sprintf("es.%s.%s.%d.*", parts[1], parts[2], version)
+	s.logger.Debugw("fetching aggregate version meta", "subject", anchorSubject)
 
+	str, err := s.js.Stream(ctx, stream)
 	if err != nil {
-		return time.Time{}, err
+		return 0, fmt.Errorf("fetch version anchor: get stream: %w", err)
 	}
 
-	msg, err := c.Next(jetstream.FetchMaxWait(10 * time.Second))
+	msg, err := str.GetLastMsgForSubject(ctx, anchorSubject)
 	if err != nil {
-		return time.Time{}, err
+		// Includes jetstream.ErrMsgNotFound, which the caller treats as
+		// "no sequence anchor" and handles non-fatally.
+		return 0, err
 	}
-	_, _, t, err := parseEventValues(msg.Headers())
-	return t, err
+
+	_, seq, err := rawStreamMsgValues(msg)
+	if err != nil {
+		return 0, fmt.Errorf("fetch version anchor: parse msg: %w", err)
+	}
+	return seq, nil
 }
 
 // streamSubject returns the stream's configured first subject, caching it so
@@ -451,7 +486,7 @@ func (s *Store) streamSubject(ctx context.Context, stream string) (string, error
 	return subject, nil
 }
 
-func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, startTime time.Time, push func(...jetstream.Msg) error, errs chan<- error) {
+func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string, subjects []string, anchor readAnchor, push func(...jetstream.Msg) error, errs chan<- error) {
 	defer wg.Done()
 
 	streamSubject, err := s.streamSubject(ctx, stream)
@@ -465,7 +500,7 @@ func (s *Store) subscribe(ctx context.Context, wg *sync.WaitGroup, stream string
 		threshold = max(threshold, time.Until(deadline)+s.pullExpiry)
 	}
 
-	conCfg := orderedConsumerConfig(subjects, startTime, streamSubject, threshold)
+	conCfg := orderedConsumerConfig(subjects, anchor, streamSubject, threshold)
 
 	c, err := s.js.OrderedConsumer(ctx, stream, conCfg)
 	if err != nil {
@@ -496,7 +531,15 @@ func normaliseSubject(streamSubject, subject string) string {
 // defers it.Stop.
 const orderedConsumerInactiveThreshold = 5 * time.Second
 
-func orderedConsumerConfig(subjects []string, startTime time.Time, streamSubject string, inactiveThreshold time.Duration) jetstream.OrderedConsumerConfig {
+// readAnchor selects where an ordered-consumer read starts. At most one of
+// startSeq / startTime is meaningful; when both are set startSeq takes
+// precedence. A zero readAnchor means DeliverAll (read from the beginning).
+type readAnchor struct {
+	startSeq  uint64
+	startTime time.Time
+}
+
+func orderedConsumerConfig(subjects []string, anchor readAnchor, streamSubject string, inactiveThreshold time.Duration) jetstream.OrderedConsumerConfig {
 	filterSubjects := make([]string, 0, len(subjects))
 	for _, s := range subjects {
 		filterSubjects = append(filterSubjects, normaliseSubject(streamSubject, s))
@@ -507,7 +550,12 @@ func orderedConsumerConfig(subjects []string, startTime time.Time, streamSubject
 		InactiveThreshold: inactiveThreshold,
 	}
 
-	if !startTime.IsZero() {
+	switch {
+	case anchor.startSeq != 0:
+		cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		cfg.OptStartSeq = anchor.startSeq
+	case !anchor.startTime.IsZero():
+		startTime := anchor.startTime
 		cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
 		cfg.OptStartTime = &startTime
 	}

@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +235,41 @@ func TestEventMetadataNormalisedEventName(t *testing.T) {
 	if got, want := m.normalisedEventName(), "order_created_v2"; got != want {
 		t.Fatalf("normalisedEventName() = %q, want %q", got, want)
 	}
+}
+
+func TestRawStreamMsgValues(t *testing.T) {
+	aggregateID := uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+	t.Run("valid subject", func(t *testing.T) {
+		msg := &jetstream.RawStreamMsg{
+			Subject:  "es.order." + aggregateID.String() + ".7.order_placed",
+			Sequence: 42,
+		}
+		version, sequence, err := rawStreamMsgValues(msg)
+		if err != nil {
+			t.Fatalf("rawStreamMsgValues() err = %v, want nil", err)
+		}
+		if version != 7 {
+			t.Errorf("version = %d, want 7", version)
+		}
+		if sequence != 42 {
+			t.Errorf("sequence = %d, want 42", sequence)
+		}
+	})
+
+	t.Run("malformed subject", func(t *testing.T) {
+		msg := &jetstream.RawStreamMsg{
+			Subject:  "es.order." + aggregateID.String() + ".7.order.placed",
+			Sequence: 42,
+		}
+		_, _, err := rawStreamMsgValues(msg)
+		if err == nil {
+			t.Fatal("rawStreamMsgValues() err = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "incorrect subject format") {
+			t.Fatalf("err = %q, want it to contain incorrect subject format", err.Error())
+		}
+	})
 }
 
 func assertHeaderValue(t *testing.T, h nats.Header, key, want string) {

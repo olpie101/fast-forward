@@ -165,29 +165,26 @@ func TestInsertIntegration(t *testing.T) {
 			t.Fatalf("Insert v=3 err = %v, want ErrValidationVersionMismatch", err)
 		}
 
-		// Lease post-state: deferred releaseLeases(_, _, true) at store.go:105-110
-		// runs versionKV.Update at store.go:317-321. genPublishMsgs returned the
-		// validation error BEFORE any js.PublishMsg call (store.go:112-114), so
-		// the publish loop is skipped. The deferred release proceeds: Update
-		// succeeds (rev still valid), then writeLeaseKV.Delete runs — lease key
-		// is deleted on this path.
+		// Lease post-state: the deferred releaseLeases now runs with
+		// committed=false because genPublishMsgs returned the validation error
+		// before the publish loop set committed=true. releaseLeases therefore
+		// skips versionKV.Update and runs writeLeaseKV.Delete — the lease key is
+		// deleted on this path.
 		if _, _, err := h.store.writeLeaseKV.Get(ctx, key); !errors.Is(err, nats.ErrKeyNotFound) {
 			t.Errorf("writeLeaseKV after validation error: err = %v, want ErrKeyNotFound", err)
 		}
 
-		// versionKV side-effect [P1-2 — passing characterization of buggy behavior]:
-		// BUG: store.go:105-110,317-321 — on validation error, versionKV must
-		// remain unchanged; current code updates it via deferred
-		// releaseLeases(ctx, leases, true). The lease's finalVersion is the
-		// rejected version (3), so versionKV is bumped to 3 even though the
-		// publish was rejected. Asserting current observed value to detect
-		// drift; flip assertion when bug is fixed.
+		// versionKV side-effect: a rejected Insert must leave versionKV
+		// unchanged. The seed Insert of v=1 committed legitimately, so the
+		// correct post-state after the rejected v=3 insert is Value==1 (the key
+		// exists and still holds the last successful version, NOT the rejected
+		// version 3 and NOT key-absent).
 		v, _, err := h.store.versionKV.Get(ctx, key)
 		if err != nil {
 			t.Fatalf("versionKV.Get post-mismatch: %v", err)
 		}
-		if v.Value != 3 {
-			t.Fatalf("versionKV.Value = %d, want 3 (current buggy behavior — flip when store.go:105-110,317-321 is fixed to skip versionKV update on validation failure)", v.Value)
+		if v.Value != 1 {
+			t.Fatalf("versionKV.Value = %d, want 1 (rejected insert must not advance versionKV past the last successful version)", v.Value)
 		}
 	})
 

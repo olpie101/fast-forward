@@ -290,31 +290,29 @@ func TestQueryIntegration(t *testing.T) {
 	})
 
 	t.Run("version_min", func(t *testing.T) {
-		// Exercises the query.go:58-69 → fetchVersionMinTime → startTime path.
+		// Exercises the query.go fetchVersionAnchorSeq → OptStartSeq path.
 		// version.Min(N) is the only constraint that populates
 		// AggregateVersions().Min() and reaches guard.hasMinVersion (see
 		// query_limit_guard.go:38-46); version.InRange does not — so the
 		// version_range subtest above cannot stand in for this one.
 		//
-		// Note: the final {3,4} assertion is also enforced by limitGuard
-		// (query_limit_guard.go:38-45 filters by version post-collect), so
-		// this is an end-to-end correctness check rather than proof that
-		// JetStream-side DeliverByStartTimePolicy filtering ran.
+		// The sequence anchor is EXACT: fetchVersionAnchorSeq resolves the
+		// stream sequence of the v=N-1 event via GetLastMsgForSubject and the
+		// read starts there (DeliverByStartSequencePolicy, inclusive), so no
+		// stored-publish-time gap workaround is needed. The final {3,4} set is
+		// also enforced by the version guard (query_limit_guard.go:38-45);
+		// builder behaviour is pinned by TestOrderedConsumerConfig.
 		h := newHarness(t, "order")
 		h.registerString(eventName)
 
 		aggID := uuid.New()
-		t0 := time.Now().UTC().Truncate(time.Millisecond)
-		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 1, t0))
-		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 2, t0))
-		// 2s stored-publish gap so DeliverByStartTimePolicy in subscribe (which
-		// filters by stored time, not header time) has a clean cut between the
-		// two batches. Final exclusion of v1/v2 from the result set is also
-		// enforced by the version guard at query_limit_guard.go:38-45.
-		time.Sleep(2 * time.Second)
-		t1 := t0.Add(time.Second)
-		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 3, t1))
-		insertEventsAt(t, h, mkEvent(t, eventName, aggID, 4, t1))
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base),
+			mkEvent(t, eventName, aggID, 2, base.Add(time.Millisecond)),
+			mkEvent(t, eventName, aggID, 3, base.Add(2*time.Millisecond)),
+			mkEvent(t, eventName, aggID, 4, base.Add(3*time.Millisecond)),
+		)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -338,6 +336,42 @@ func TestQueryIntegration(t *testing.T) {
 			if v != 3 && v != 4 {
 				t.Errorf("version %d outside {3,4}", v)
 			}
+		}
+	})
+
+	t.Run("version_min_anchor_absent_non_fatal", func(t *testing.T) {
+		// When the v=N-1 anchor event does not exist, fetchVersionAnchorSeq
+		// returns jetstream.ErrMsgNotFound. The query MUST NOT fail or hang: it
+		// falls back to the time/zero anchor and the version guard still filters
+		// the result. Here only v1,v2 exist and version.Min(4) excludes them, so
+		// the anchor (v=3) is absent and the result is empty — proving the
+		// ErrMsgNotFound fallback is non-fatal.
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base),
+			mkEvent(t, eventName, aggID, 2, base.Add(time.Millisecond)),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, errsCh, err := h.store.Query(ctx, query.New(
+			query.AggregateName("order"),
+			query.AggregateID(aggID),
+			query.AggregateVersion(version.Min(4)),
+		))
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		got, gotErrs := drainQuery(t, out, errsCh, 5*time.Second)
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != 0 {
+			t.Fatalf("len(got) = %d, want 0 (anchor absent; guard filters v1,v2)", len(got))
 		}
 	})
 
@@ -393,10 +427,6 @@ func TestQueryIntegration(t *testing.T) {
 			t.Fatalf("err = %q, want substring %q", err.Error(), "no stream for aggregate")
 		}
 	})
-}
-
-func TestQueryIntegrationMalformedSubjectPanic_Skip(t *testing.T) {
-	t.Skip("store/nats/query.go:190-191 fetchVersionMinTime: condition uses && instead of ||; well-formed subjects with parts[3]==\"*\" wrongly pass while malformed (len!=5) subjects panic on parts[3] index; desired: if len(parts) != 5 || parts[3] != \"*\" { return errors.New(...) }. Cannot exercise via Store.Query because subjects are constructed by buildQuery (always 5 parts).")
 }
 
 func TestQuerySyncCollectTODO_Skip(t *testing.T) {

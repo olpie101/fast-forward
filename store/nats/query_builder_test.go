@@ -141,10 +141,10 @@ func TestOrderedConsumerConfig(t *testing.T) {
 	const streamSubject = "es.order.>"
 	const threshold = 30 * time.Second
 
-	t.Run("zero startTime leaves DeliverAll defaults", func(t *testing.T) {
+	t.Run("zero anchor leaves DeliverAll defaults", func(t *testing.T) {
 		cfg := orderedConsumerConfig(
 			[]string{"es.order." + uuid.New().String() + ".1.*"},
-			time.Time{},
+			readAnchor{},
 			streamSubject,
 			threshold,
 		)
@@ -153,6 +153,9 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		}
 		if cfg.OptStartTime != nil {
 			t.Errorf("OptStartTime = %v, want nil", cfg.OptStartTime)
+		}
+		if cfg.OptStartSeq != 0 {
+			t.Errorf("OptStartSeq = %d, want 0", cfg.OptStartSeq)
 		}
 		if len(cfg.FilterSubjects) != 1 {
 			t.Fatalf("len(FilterSubjects) = %d, want 1", len(cfg.FilterSubjects))
@@ -166,7 +169,7 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		start := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
 		cfg := orderedConsumerConfig(
 			[]string{"es.order.*.*.*"},
-			start,
+			readAnchor{startTime: start},
 			streamSubject,
 			threshold,
 		)
@@ -184,6 +187,43 @@ func TestOrderedConsumerConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("non-zero startSeq selects DeliverByStartSequencePolicy", func(t *testing.T) {
+		cfg := orderedConsumerConfig(
+			[]string{"es.order.*.*.*"},
+			readAnchor{startSeq: 42},
+			streamSubject,
+			threshold,
+		)
+		if cfg.DeliverPolicy != jetstream.DeliverByStartSequencePolicy {
+			t.Errorf("DeliverPolicy = %v, want DeliverByStartSequencePolicy", cfg.DeliverPolicy)
+		}
+		if cfg.OptStartSeq != 42 {
+			t.Errorf("OptStartSeq = %d, want 42", cfg.OptStartSeq)
+		}
+		if cfg.OptStartTime != nil {
+			t.Errorf("OptStartTime = %v, want nil", cfg.OptStartTime)
+		}
+	})
+
+	t.Run("both set prefers sequence", func(t *testing.T) {
+		start := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
+		cfg := orderedConsumerConfig(
+			[]string{"es.order.*.*.*"},
+			readAnchor{startSeq: 7, startTime: start},
+			streamSubject,
+			threshold,
+		)
+		if cfg.DeliverPolicy != jetstream.DeliverByStartSequencePolicy {
+			t.Errorf("DeliverPolicy = %v, want DeliverByStartSequencePolicy", cfg.DeliverPolicy)
+		}
+		if cfg.OptStartSeq != 7 {
+			t.Errorf("OptStartSeq = %d, want 7", cfg.OptStartSeq)
+		}
+		if cfg.OptStartTime != nil {
+			t.Errorf("OptStartTime = %v, want nil (sequence takes precedence)", cfg.OptStartTime)
+		}
+	})
+
 	t.Run("FilterSubjects normalised against stream subject", func(t *testing.T) {
 		// normaliseSubject substitutes the stream-subject's aggregate-name
 		// segment when the query subject differs. Pass a query subject with
@@ -193,7 +233,7 @@ func TestOrderedConsumerConfig(t *testing.T) {
 			"es.invoice." + id.String() + ".*.*",
 			"es.invoice." + id.String() + ".5.*",
 		}
-		cfg := orderedConsumerConfig(querySubjects, time.Time{}, "es.order.>", threshold)
+		cfg := orderedConsumerConfig(querySubjects, readAnchor{}, "es.order.>", threshold)
 		want := []string{
 			"es.order." + id.String() + ".*.*",
 			"es.order." + id.String() + ".5.*",

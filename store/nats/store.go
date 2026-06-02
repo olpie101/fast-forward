@@ -103,8 +103,13 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 	if err != nil {
 		return err
 	}
+	// versionKV is advanced only after the publish loop completes
+	// successfully. committed is read by reference when the deferred release
+	// runs, so a rejected/failed insert releases the lease without bumping
+	// versionKV.
+	committed := false
 	defer func() {
-		rErr := s.releaseLeases(ctx, leases, true)
+		rErr := s.releaseLeases(ctx, leases, committed)
 		if rErr != nil {
 			s.logger.Errorw("unable to release leases")
 		}
@@ -133,6 +138,7 @@ func (s *Store) Insert(ctx context.Context, evts ...event.Event) error {
 			return err
 		}
 	}
+	committed = true
 	if len(evts) > 0 {
 		s.logger.Debug("inserted events")
 	}
@@ -364,13 +370,56 @@ func (s *Store) getOrCreateCurrentVersion(ctx context.Context, key string) (uint
 		return 0, 0, err
 	}
 	if notFound {
-		rev, err = s.versionKV.Create(ctx, key, &kv.UInt64Value{Value: 0})
+		seed, err := s.reconcileVersionFromStream(ctx, key)
 		if err != nil {
 			return 0, 0, err
 		}
-		return 0, rev, nil
+		rev, err = s.versionKV.Create(ctx, key, &kv.UInt64Value{Value: seed})
+		if err != nil {
+			return 0, 0, err
+		}
+		return seed, rev, nil
 	}
 	return v.Value, rev, nil
+}
+
+// reconcileVersionFromStream derives the latest committed aggregate version for
+// a write-lease key from the event stream. It is called ONLY from the not-found
+// branch of getOrCreateCurrentVersion (cold key), so it never runs on the hot
+// path. A missing last message (ErrMsgNotFound) means the aggregate has no
+// events yet and reconciles to version 0 (preserving the prior seed-0
+// behavior); all other errors propagate so a transient failure never seeds a
+// stale baseline into versionKV.
+func (s *Store) reconcileVersionFromStream(ctx context.Context, key string) (uint64, error) {
+	name, id, ok := strings.Cut(key, ".")
+	if !ok {
+		return 0, fmt.Errorf("reconcile version: invalid write lease key %q", key)
+	}
+
+	streamName, err := s.streamNameForAggregate(ctx, name)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile version: resolve stream: %w", err)
+	}
+
+	stream, err := s.js.Stream(ctx, streamName)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile version: get stream: %w", err)
+	}
+
+	subject := fmt.Sprintf("es.%s.%s.>", name, id)
+	msg, err := stream.GetLastMsgForSubject(ctx, subject)
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("reconcile version: get last msg: %w", err)
+	}
+
+	version, _, err := rawStreamMsgValues(msg)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile version: parse msg: %w", err)
+	}
+	return uint64(version), nil
 }
 
 func validateStore(s *Store) error {
