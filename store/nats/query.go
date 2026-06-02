@@ -85,7 +85,12 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 		cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, anchor)
 		out, errs := s.streamReplay(subCtx, cancel, groups, anchor, guard, cmsgs, subErrs)
 		streaming = true
-		return out, errs, nil
+		// streamReplay owns the streaming path's ErrNoHeartbeat retry and reports
+		// any terminal error only on the returned errs channel. Returning a nil
+		// synchronous error here is load-bearing: it makes Store.Query's outer
+		// retry loop a deliberate no-op for the streaming path so it is never
+		// retried twice.
+		return out, errs, nil // nil sync error intentional — see comment above
 	}
 
 	cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, anchor)
@@ -194,8 +199,10 @@ func isSingleAggregateVersionAscSort(q event.Query) bool {
 }
 
 // streamReplay owns the returned out/errs channels and the subCtx cancel for
-// the streaming fast path. A single coordinator goroutine is the sole sender to
-// errs and the sole closer of both channels.
+// the streaming fast path, and is the sole owner of the streaming path's
+// ErrNoHeartbeat retry (Store.Query's outer loop owns materialized-path retry;
+// the two sites are deliberately separate). A single coordinator goroutine is
+// the sole sender to errs and the sole closer of both channels.
 func (s *Store) streamReplay(
 	subCtx context.Context,
 	cancel context.CancelFunc,
@@ -213,7 +220,7 @@ func (s *Store) streamReplay(
 		defer close(errs)
 		defer close(out)
 
-		// Mirror Store.Query's retry budget (store.go:158-173). Retry is only
+		// Mirror Store.Query's retry budget (store.go:187-202). Retry is only
 		// safe before the first event is emitted: an ordered-consumer restart
 		// re-delivers from the start and would double-emit already-sent events.
 		// The materialized fallback never emits before completing, so pre-emit

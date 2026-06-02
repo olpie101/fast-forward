@@ -41,6 +41,12 @@ type Store struct {
 	pullExpiry          time.Duration
 	writeLeaseKV        kv.KeyValuer[*kv.NilValue]
 	versionKV           kv.KeyValuer[*kv.UInt64Value]
+	// queryAttempt and afterFn are package-internal test seams for the outer
+	// (materialized-path) retry loop in Query. The options:"-" tag keeps
+	// go-options from generating With* options for them; both default to the
+	// real behavior (s.query and time.After) in New.
+	queryAttempt func(ctx context.Context, q event.Query, subjects []string) (<-chan event.Event, <-chan error, error) `options:"-"`
+	afterFn      func(time.Duration) <-chan time.Time                                                                  `options:"-"`
 }
 
 type versionInfo struct {
@@ -77,6 +83,8 @@ func New(nc *nats.Conn, enc codec.Encoding, opts ...StoreOption) (*Store, error)
 		evtStreamMapper:     map[string][]string{},
 		streamSubjectMapper: map[string]string{},
 	}
+	s.queryAttempt = s.query
+	s.afterFn = time.After
 
 	err = applyStoreOptions(s, options...)
 	if err != nil {
@@ -171,14 +179,19 @@ func (s *Store) Query(ctx context.Context, q event.Query) (<-chan event.Event, <
 	var evts <-chan event.Event = nil
 	var errs <-chan error = nil
 
+	// This loop owns ErrNoHeartbeat retry for the MATERIALIZED query path only.
+	// The streaming fast path (canStreamReplay) returns a nil synchronous error
+	// by design and self-retries inside streamReplay, so it is intentionally
+	// invisible to this loop and is never retried here. See the streaming return
+	// site and streamReplay in query.go for the streaming-path retry ownership.
 	for i := 0; i < int(s.retryCount); i++ {
-		evts, errs, err = s.query(ctx, q, subjects)
+		evts, errs, err = s.queryAttempt(ctx, q, subjects)
 		if err != nil {
 			// retry if possible
 			if errors.Is(err, jetstream.ErrNoHeartbeat) && i < int(s.retryCount)-1 {
 				s.logger.Errorw("error consuming messages retrying...", "count", i+1)
 				backoff := time.Duration(2 * math.Pow(2, float64(i)))
-				<-time.After(backoff * time.Second)
+				<-s.afterFn(backoff * time.Second)
 				continue
 			} else {
 				s.logger.Errorw("error executing query", "err", err)
