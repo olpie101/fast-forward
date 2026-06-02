@@ -665,3 +665,113 @@ func TestQueryStreamingFastPath(t *testing.T) {
 		}
 	})
 }
+
+// TestQueryMaterializedParallelDecode covers the bounded parallel-decode pool on
+// the materialized read path (#5): correct delivery under many events, the
+// multi-error contract (regression for the former cap-1 opErrs deadlock), and
+// prompt return under context cancellation.
+func TestQueryMaterializedParallelDecode(t *testing.T) {
+	const eventName = "order.created"
+
+	t.Run("many_events_all_delivered_ordered", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		// More than queryDecodeWorkers so multiple workers are exercised.
+		const n = queryDecodeWorkers * 2
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		evts := make([]event.Event, 0, n)
+		for i := 0; i < n; i++ {
+			evts = append(evts, mkEvent(t, eventName, aggID, i+1, base.Add(time.Duration(i)*time.Millisecond)))
+		}
+		insertEventsAt(t, h, evts...)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Aggregate-name-only (wildcard id) takes the materialized path.
+		got, gotErrs := drainQueryFor(t, h, ctx, query.New(query.AggregateName("order")))
+		if len(gotErrs) != 0 {
+			t.Fatalf("query errors: %v", gotErrs)
+		}
+		if len(got) != n {
+			t.Fatalf("len(got) = %d, want %d", len(got), n)
+		}
+		// Default sort is event.Time ascending; SortMulti must restore order
+		// regardless of decode/emit order from the worker pool.
+		for i := 1; i < len(got); i++ {
+			if got[i].Time().Before(got[i-1].Time()) {
+				t.Fatalf("result not time-ascending at %d: %v then %v", i, got[i-1].Time(), got[i].Time())
+			}
+		}
+	})
+
+	t.Run("multiple_decode_errors_all_delivered_no_deadlock", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Publish >=2 malformed messages so processQueryMsg fails on multiple
+		// messages. A cap-1 opErrs channel would deadlock the decode pool here.
+		const bad = 3
+		for i := 0; i < bad; i++ {
+			aggID := uuid.New()
+			subject := fmt.Sprintf("es.order.%s.1.%s", aggID, normaliseEventName(eventName))
+			header := make(nats.Header)
+			header.Set(MetadataKeyEventName, eventName)
+			header.Set(MetadataKeyEventTime, time.Now().UTC().Format(time.RFC3339Nano))
+			header.Set(jetstream.MsgIDHeader, uuid.New().String())
+			if _, err := h.js.PublishMsg(ctx, &nats.Msg{
+				Subject: subject,
+				Header:  header,
+				Data:    []byte("{not valid json for a string}"),
+			}); err != nil {
+				t.Fatalf("PublishMsg: %v", err)
+			}
+		}
+
+		got, gotErrs := drainQueryFor(t, h, ctx, query.New(query.AggregateName("order")))
+		if len(got) != 0 {
+			t.Fatalf("len(got) = %d, want 0 (all messages undecodable)", len(got))
+		}
+		if len(gotErrs) < 2 {
+			t.Fatalf("len(gotErrs) = %d, want >= 2 (multi-error contract)", len(gotErrs))
+		}
+	})
+
+	t.Run("context_cancellation_returns_promptly", func(t *testing.T) {
+		h := newHarness(t, "order")
+		h.registerString(eventName)
+
+		aggID := uuid.New()
+		base := time.Now().UTC().Truncate(time.Millisecond)
+		insertEventsAt(t, h,
+			mkEvent(t, eventName, aggID, 1, base),
+			mkEvent(t, eventName, aggID, 2, base.Add(1*time.Millisecond)),
+		)
+
+		// A cancelled context must make Query unwind promptly without leaking
+		// decode workers; drainQuery's deadline bounds the assertion.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		evts, errs, err := h.store.Query(ctx, query.New(query.AggregateName("order")))
+		if err != nil {
+			// A synchronous cancellation error is acceptable.
+			return
+		}
+		drainQuery(t, evts, errs, 5*time.Second)
+	})
+}
+
+// drainQueryFor runs a materialized query and drains both channels with a
+// deadline, failing the test on a synchronous error.
+func drainQueryFor(t *testing.T, h *integrationHarness, ctx context.Context, q event.Query) ([]event.Event, []error) {
+	t.Helper()
+	evts, errs, err := h.store.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("Query returned synchronous error: %v", err)
+	}
+	return drainQuery(t, evts, errs, 5*time.Second)
+}

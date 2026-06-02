@@ -95,19 +95,24 @@ func (s *Store) query(ctx context.Context, q event.Query, subjects []string) (<-
 
 	cmsgs, subErrs := s.spawnSubscriptions(subCtx, groups, anchor)
 
-	opErrs := make(chan error, 1)
-	defer close(opErrs)
-
-	// TODO: this collect is sync
-	evts, err := s.collect(ctx, cmsgs, opErrs, guard)
-	if err != nil {
-		opErrs <- err
-	}
+	// Decode concurrently with a bounded worker pool. Pre-sort emission order is
+	// irrelevant because event.SortMulti below restores the requested ordering.
+	evts, decodeErrs := s.collect(ctx, cmsgs, guard)
 
 	err = <-subErrs
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Size opErrs to hold every decode error (plus headroom) so all errors are
+	// buffered before close on BOTH return paths below; the materialized path is
+	// synchronous, so drainQuery observes the full set. A cap-1 channel would
+	// deadlock the decode pool on >=2 errors.
+	opErrs := make(chan error, len(decodeErrs)+1)
+	for _, e := range decodeErrs {
+		opErrs <- e
+	}
+	close(opErrs)
 
 	select {
 	case <-subCtx.Done():
@@ -603,23 +608,58 @@ func consumeMessages(c jetstream.Consumer, push func(...jetstream.Msg) error, ex
 	return nil
 }
 
-func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, errs chan error, g limitGuard) ([]event.Event, error) {
-	return streams.All(
-		streams.Filter(
-			streams.Map(
-				ctx,
-				msgs,
-				func(m jetstream.Msg) event.Event {
+// queryDecodeWorkers bounds the materialized-path decode pool. Decoding
+// (enc.Unmarshal) is CPU-bound and order-independent because query() sorts
+// after collect returns, so a fixed pool drains the message channel
+// concurrently without spawning a goroutine per message.
+const queryDecodeWorkers = 8
+
+// collect decodes messages from msgs concurrently with a bounded worker pool,
+// dropping events that fail the nil-filter or the limit guard. It returns the
+// surviving events (in arbitrary order — query() sorts afterward) and every
+// decode error. Workers drain msgs until spawnSubscriptions closes it or ctx is
+// cancelled, then a WaitGroup join gates the return so no worker outlives the
+// call.
+func (s *Store) collect(ctx context.Context, msgs <-chan jetstream.Msg, g limitGuard) ([]event.Event, []error) {
+	var (
+		mu   sync.Mutex
+		evts []event.Event
+		errs []error
+		wg   sync.WaitGroup
+	)
+
+	wg.Add(queryDecodeWorkers)
+	for i := 0; i < queryDecodeWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case m, ok := <-msgs:
+					if !ok {
+						return
+					}
 					e, err := s.processQueryMsg(m)
 					if err != nil {
-						errs <- err
+						mu.Lock()
+						errs = append(errs, err)
+						mu.Unlock()
+						continue
 					}
-					return e
-				}),
-			func(e event.Event) bool { return e != nil },
-			g.guard,
-		),
-	)
+					if e == nil || !g.guard(e) {
+						continue
+					}
+					mu.Lock()
+					evts = append(evts, e)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	return evts, errs
 }
 
 func (s *Store) processQueryMsg(msg jetstream.Msg) (event.Event, error) {
