@@ -1,8 +1,8 @@
 package micro
 
-// Handler-pipeline tests. NOTE: production code at endpointer.go:61,63,69,75,83
-// emits stdout debug prints on every request; this file does NOT capture
-// stdout — the prints are tolerated noise (precedent: projection/streams.go:139).
+// Handler-pipeline tests for the inline (default) path. The wrapper no longer
+// emits stdout debug prints; the inline path runs the handler on the delivery
+// goroutine and reports errors via r.Error.
 
 import (
 	"context"
