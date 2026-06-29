@@ -73,6 +73,37 @@ func TestWithTimeoutSetsDuration(t *testing.T) {
 	}
 }
 
+func TestDefaultEndpointOptionsConcurrencyIsOne(t *testing.T) {
+	e := defaultEndpointOptions(nil)
+	if e.maxInFlight != 1 {
+		t.Errorf("default maxInFlight: want 1 (inline serial), got %d", e.maxInFlight)
+	}
+}
+
+func TestWithConcurrencySetsField(t *testing.T) {
+	for _, n := range []int{0, 1, 4} {
+		e := defaultEndpointOptions(nil)
+		if err := WithConcurrency(n)(e); err != nil {
+			t.Fatalf("WithConcurrency(%d) err: %v", n, err)
+		}
+		if e.maxInFlight != n {
+			t.Errorf("WithConcurrency(%d): maxInFlight = %d", n, e.maxInFlight)
+		}
+	}
+}
+
+func TestWithConcurrencyNegativeReturnsError(t *testing.T) {
+	e := defaultEndpointOptions(nil)
+	original := e.maxInFlight
+	err := WithConcurrency(-1)(e)
+	if err == nil || err.Error() != "concurrency cannot be negative" {
+		t.Errorf("want \"concurrency cannot be negative\", got %v", err)
+	}
+	if e.maxInFlight != original {
+		t.Errorf("maxInFlight must be unchanged on error: want %d, got %d", original, e.maxInFlight)
+	}
+}
+
 func TestWithContextSetsContext(t *testing.T) {
 	e := defaultEndpointOptions(nil)
 	ctx := context.WithValue(context.Background(), ctxK{}, "v")

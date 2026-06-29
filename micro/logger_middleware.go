@@ -14,9 +14,11 @@ type LoggerFieldsProvider func(context.Context) []any
 type loggerFieldsContextKey struct{}
 
 func WithLoggerFields(ctx context.Context, fields ...any) context.Context {
-	existingFields := LoggerFieldsFromContext(ctx)
-	existingFields = append(existingFields, fields...)
-	return context.WithValue(ctx, loggerFieldsContextKey{}, existingFields)
+	existing := LoggerFieldsFromContext(ctx)
+	combined := make([]any, 0, len(existing)+len(fields))
+	combined = append(combined, existing...)
+	combined = append(combined, fields...)
+	return context.WithValue(ctx, loggerFieldsContextKey{}, combined)
 }
 
 // LoggerFieldsFromContext extracts logger fields from context

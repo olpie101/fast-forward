@@ -3,7 +3,6 @@ package micro
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/invopop/jsonschema"
@@ -37,6 +36,7 @@ type endpointOpts struct {
 	logger              *zap.SugaredLogger
 	loggerRequestFields []interface{}
 	middlewares         []Middleware
+	maxInFlight         int
 }
 
 func (o *endpointOpts) Handler() micro.Handler {
@@ -44,49 +44,138 @@ func (o *endpointOpts) Handler() micro.Handler {
 	for _, mw := range o.middlewares {
 		fn = mw(fn)
 	}
-	return micro.ContextHandler(o.ctx, func(ctx context.Context, r micro.Request) {
-		loggingFields := append(o.loggerRequestFields, "micro_request_length", len(r.Data()))
+
+	// execute runs the decode -> handler -> encode pipeline on a per-request
+	// context and returns either the encoded success payload or an error. It
+	// never responds. On a normal/error return it does not cancel: the returned
+	// CancelFunc is non-nil and the caller owns the cancel timing, which
+	// deliberately differs between the inline and async paths. The only case
+	// where execute cancels is while unwinding a panic raised after the
+	// per-request context was created (decoder, handler, or encoder); it then
+	// re-panics, and the caller never receives a CancelFunc.
+	execute := func(ctx context.Context, r micro.Request) (context.CancelFunc, []byte, error) {
+		// Copy the shared logger request fields before appending the
+		// request-specific entries. Appending directly to o.loggerRequestFields
+		// would alias its backing array across requests, which races once the
+		// async path runs multiple requests concurrently.
+		loggingFields := make([]any, 0, len(o.loggerRequestFields)+2)
+		loggingFields = append(loggingFields, o.loggerRequestFields...)
+		loggingFields = append(loggingFields, "micro_request_length", len(r.Data()))
 		ctx = WithLoggerFields(ctx, loggingFields...)
 		ctx = o.ctxFn(ctx, r.Subject(), r.Headers())
 		ctx, cancel := handlerCtx(ctx, o.timeout)
-		var err error
-		var respErr error
-		var b []byte
-		defer cancel()
+
+		// On a normal return the caller owns cancel() so it runs after the
+		// response (preserving the original inline ordering). A panic in the
+		// decoder, handler, or encoder never returns to the caller, so cancel
+		// it here during unwinding and re-panic to preserve propagation.
 		defer func() {
-			if err == nil {
-				return
+			if rec := recover(); rec != nil {
+				if cancel != nil {
+					cancel()
+				}
+				panic(rec)
 			}
-			code, desc, d, h := wrappedErrorFn(err, o.errFn)
-			fmt.Println("returning error", code, desc, d, h)
-			respErr = r.Error(code, desc, d, micro.WithHeaders(h))
-			fmt.Println("returned error")
-			_ = respErr
 		}()
 
 		req, err := o.decFn(r.Data())
 		if err != nil {
-			fmt.Println("returning error after  dec func")
-			return
+			return cancel, nil, err
 		}
 
 		res, err := fn(ctx, req)
 		if err != nil {
-			fmt.Println("returning error after func")
-
-			return
+			return cancel, nil, err
 		}
 
-		b, err = o.encFn(res)
-
+		b, err := o.encFn(res)
 		if err != nil {
-			fmt.Println("returning error after enc func")
-			return
+			return cancel, nil, err
 		}
 
-		respErr = r.Respond(b)
-	})
+		return cancel, b, nil
+	}
 
+	// runInline preserves the original synchronous lifecycle byte-for-byte
+	// (minus the removed debug prints). It runs on the NATS delivery goroutine,
+	// so its r.Error write happens-before nats.go's reqHandler reads
+	// request.respondError after Handle returns; the error response is therefore
+	// race-free and is reported via nats.go's built-in NumErrors/LastError stats.
+	runInline := func(ctx context.Context, r micro.Request) {
+		cancel, b, err := execute(ctx, r)
+		defer cancel()
+		if err != nil {
+			code, desc, d, h := wrappedErrorFn(err, o.errFn)
+			_ = r.Error(code, desc, d, micro.WithHeaders(h))
+			return
+		}
+		_ = r.Respond(b)
+	}
+
+	// runAsync mirrors runInline but is safe to invoke from a spawned goroutine.
+	// It must never call r.Error: nats.go's request.Error writes respondError
+	// unconditionally (request.go:152,155) after Handle has returned, racing
+	// reqHandler's read (service.go:700) for every async error. Instead it
+	// replicates Error's wire format through Respond, which only writes
+	// respondError on publish failure (request.go:113). Successful async error
+	// publishes are therefore race-free, but are NOT counted by nats.go's
+	// built-in NumErrors/LastError. The empty-arg skip mirrors request.Error's
+	// guard at request.go:134-139.
+	runAsync := func(ctx context.Context, r micro.Request) {
+		cancel, b, err := execute(ctx, r)
+		defer cancel()
+		if err != nil {
+			code, desc, d, h := wrappedErrorFn(err, o.errFn)
+			if code == "" || desc == "" {
+				return
+			}
+			_ = r.Respond(d,
+				micro.WithHeaders(micro.Headers{
+					micro.ErrorHeader:     []string{desc},
+					micro.ErrorCodeHeader: []string{code},
+				}),
+				micro.WithHeaders(h),
+			)
+			return
+		}
+		_ = r.Respond(b)
+	}
+
+	// maxInFlight <= 1 selects the genuine inline serial path: no goroutine, no
+	// semaphore, handler runs on the delivery goroutine exactly as before.
+	if o.maxInFlight <= 1 {
+		return micro.ContextHandler(o.ctx, runInline)
+	}
+
+	// Bounded async path. The semaphore is acquired on the delivery goroutine
+	// before spawning, preserving arrival-order backpressure (but not completion
+	// ordering) and capping in-flight handlers at maxInFlight. This is
+	// semaphore-only by design (Option A): there is no WaitGroup and no drain.
+	// Service.Stop() drains the NATS subscription but does NOT wait for these
+	// goroutines, so a handler cut off mid-flight may fail its later Respond and
+	// the client may time out. This does not corrupt store state because the
+	// write path's OCC safeguards (writeLeaseKV lease, versionKV,
+	// ErrLeaseLocked, ErrValidationVersionMismatch) make interrupted writes fail
+	// safely.
+	//
+	// Accepted residual race: on a Respond publish failure (response exceeds the
+	// server max_payload, or the connection is closing/draining) the async
+	// worker writes nats.go's internal request.respondError (request.go:113)
+	// after Handle has returned, racing reqHandler's read (service.go:700). The
+	// user-visible effect is a dropped reply / request timeout; in a narrow
+	// timing tail it can cause a torn-interface read in reqHandler (potential
+	// crash) or, far more commonly, a missed NumErrors stat. Store correctness
+	// is unaffected (OCC safeguards above). Eliminating this fully would require
+	// publishing replies via an injected *nats.Conn (option ii / WithConn),
+	// which is deliberately out of scope for this iteration.
+	sem := make(chan struct{}, o.maxInFlight)
+	return micro.ContextHandler(o.ctx, func(ctx context.Context, r micro.Request) {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			runAsync(ctx, r)
+		}()
+	})
 }
 
 func handlerCtx(ctx context.Context, t time.Duration) (context.Context, context.CancelFunc) {
@@ -151,6 +240,7 @@ func defaultEndpointOptions(fn Handler) *endpointOpts {
 		},
 		logger:      zap.NewNop().Sugar(),
 		middlewares: make([]Middleware, 0),
+		maxInFlight: 1,
 	}
 }
 
@@ -195,6 +285,53 @@ func WithJsonSchema(reflector jsonschema.Reflector, req interface{}, res interfa
 func WithTimeout(t time.Duration) EndpointOption {
 	return func(e *endpointOpts) error {
 		e.timeout = t
+		return nil
+	}
+}
+
+// WithConcurrency selects how an endpoint processes incoming requests.
+//
+// maxInFlight <= 1 (the default is 1) uses the genuine inline serial path: the
+// handler, middlewares, decoders, encoders, error mappers, and context
+// functions run on the NATS delivery goroutine, one request at a time, exactly
+// as without this option. maxInFlight > 1 enables bounded async processing:
+// each request is offloaded to a goroutine with at most maxInFlight in flight
+// per endpoint. Negative values are invalid.
+//
+// In async mode the same middleware-wrapped handler and the decode/encode/error/
+// context functions are invoked concurrently and MUST be safe for concurrent
+// use; thread-safety is the caller's responsibility. Async mode does not
+// preserve per-endpoint request ordering and is not keyed/partitioned.
+//
+// Async mode also changes nats.go micro stats: built-in ProcessingTime measures
+// spawn/gate time (nats.go times the inline Handle return), and async error
+// responses are delivered via Respond with error headers rather than r.Error,
+// so they are not counted by nats.go's built-in NumErrors/LastError.
+//
+// Shutdown: Service.Stop() drains the NATS subscription but does not wait for
+// goroutines spawned by async endpoints. A handler cut off mid-flight will fail
+// its later Respond call and the client will time out. True service-level
+// graceful drain is deferred to future work.
+//
+// Residual publish-failure race: in async mode, normal success and error
+// responses avoid r.Error and are therefore race-clean under the Go race
+// detector. However, if a Respond publish itself fails — because the response
+// exceeds the server max_payload, or the connection is closing or draining —
+// nats.go micro writes its internal respondError from the worker goroutine after
+// Handle has returned, which can race the stats read in reqHandler. The
+// user-visible effect is a dropped reply / request timeout. In a narrow timing
+// tail the race can cause a torn-interface read (potential crash); the common
+// outcome is a missed NumErrors stat. Store correctness is unaffected: the
+// write-path OCC safeguards (lease, version key, ErrLeaseLocked,
+// ErrValidationVersionMismatch) make interrupted writes fail safely. Eliminating
+// the residual race fully would require publishing replies through an injected
+// *nats.Conn, which is deferred to future work.
+func WithConcurrency(maxInFlight int) EndpointOption {
+	return func(e *endpointOpts) error {
+		if maxInFlight < 0 {
+			return errors.New("concurrency cannot be negative")
+		}
+		e.maxInFlight = maxInFlight
 		return nil
 	}
 }
