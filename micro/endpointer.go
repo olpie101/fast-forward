@@ -306,9 +306,26 @@ func WithTimeout(t time.Duration) EndpointOption {
 // Async mode also changes nats.go micro stats: built-in ProcessingTime measures
 // spawn/gate time (nats.go times the inline Handle return), and async error
 // responses are delivered via Respond with error headers rather than r.Error,
-// so they are not counted by nats.go's built-in NumErrors/LastError. See the
-// Handler documentation for the accepted shutdown and publish-failure
-// limitations.
+// so they are not counted by nats.go's built-in NumErrors/LastError.
+//
+// Shutdown: Service.Stop() drains the NATS subscription but does not wait for
+// goroutines spawned by async endpoints. A handler cut off mid-flight will fail
+// its later Respond call and the client will time out. True service-level
+// graceful drain is deferred to future work.
+//
+// Residual publish-failure race: in async mode, normal success and error
+// responses avoid r.Error and are therefore race-clean under the Go race
+// detector. However, if a Respond publish itself fails — because the response
+// exceeds the server max_payload, or the connection is closing or draining —
+// nats.go micro writes its internal respondError from the worker goroutine after
+// Handle has returned, which can race the stats read in reqHandler. The
+// user-visible effect is a dropped reply / request timeout. In a narrow timing
+// tail the race can cause a torn-interface read (potential crash); the common
+// outcome is a missed NumErrors stat. Store correctness is unaffected: the
+// write-path OCC safeguards (lease, version key, ErrLeaseLocked,
+// ErrValidationVersionMismatch) make interrupted writes fail safely. Eliminating
+// the residual race fully would require publishing replies through an injected
+// *nats.Conn, which is deferred to future work.
 func WithConcurrency(maxInFlight int) EndpointOption {
 	return func(e *endpointOpts) error {
 		if maxInFlight < 0 {
