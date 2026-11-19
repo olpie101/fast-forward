@@ -30,6 +30,8 @@ type Worker struct {
 	projector  Projector
 	running    bool
 	onError    func(projection.Job, error)
+
+	jobMiddleware []JobMiddleware
 }
 
 var defaultOnErrorFunc = func(projection.Job, error) {}
@@ -62,7 +64,7 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 		ctx = context.WithValue(ctx, ContextKeyId, jobId)
 
 		svc.logger.Infow("starting worker", "name", name)
-		errs, err := s.Subscribe(ctx, svc.projector.HandleJob)
+		errs, err := s.Subscribe(ctx, svc.jobHandler(name))
 		if err != nil {
 			return nil, fmt.Errorf("error subscribing to projection worker (%s): %w", name, err)
 		}
@@ -90,7 +92,7 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 		ctx,
 		triggerErrs,
 		func(e error) error {
-			svc.logger.Errorw("trigger err", "err", err)
+			svc.logger.Errorw("trigger err", "err", e)
 			return fmt.Errorf("projection trigger error occurred: %w", e)
 		},
 	)
@@ -104,4 +106,21 @@ func (svc *Worker) Start(ctx context.Context, opts ...projection.SubscribeOption
 	}
 
 	return streams.FanInContext(ctx, triggerErrs, projErrs), nil
+}
+
+// jobHandler is the projector's HandleJob for the schedule called name,
+// wrapped by the job middleware (first = outermost). A failed job is reported
+// to the WithErrorFunc callback before its error reaches the error channel.
+func (svc *Worker) jobHandler(name string) func(projection.Job) error {
+	handle := JobHandler(svc.projector.HandleJob)
+	for i := len(svc.jobMiddleware) - 1; i >= 0; i-- {
+		handle = svc.jobMiddleware[i](name, handle)
+	}
+	return func(job projection.Job) error {
+		err := handle(job)
+		if err != nil {
+			svc.onError(job, err)
+		}
+		return err
+	}
 }
